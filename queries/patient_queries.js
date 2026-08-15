@@ -1,0 +1,393 @@
+const getDateFilteredPatientsQuery = `SELECT *, DATE_FORMAT(updatedAt, '%d/%m/%Y') AS formattedUpdatedAt
+FROM patient_master
+WHERE DATE_FORMAT(updatedAt, '%d/%m/%Y') BETWEEN :fromDate AND :toDate`;
+
+const getPatientsQuery = `
+SELECT 
+    base.*,
+    CASE
+        WHEN base.plan = '-' OR base.plan IS NULL OR TRIM(base.plan) = '' THEN '-'
+        WHEN UPPER(TRIM(base.plan)) LIKE '%OI%TI%' OR UPPER(TRIM(base.plan)) LIKE '%TI%OI%' THEN 'OI + TI'
+        WHEN UPPER(TRIM(base.plan)) LIKE '%IUI%' THEN 'IUI'
+        WHEN UPPER(TRIM(base.plan)) LIKE '%ICSI%' THEN 'IVF'
+        ELSE '-'
+    END AS treatmentType
+FROM (
+    select pm.id, patientId,
+    pm.photoPath ,
+    pm.branchId,
+    (SELECT bm.branchCode FROM branch_master bm WHERE bm.id = pm.branchId) AS branch,
+    CAST(pm.createdAt as DATE) as registeredDate,
+    pm.createdAt,
+    JSON_OBJECT('id', patientTypeId, 'name', COALESCE(ptm.patientType, '')) AS patientType,
+    aadhaarNo,mobileNo,CONCAT(lastName,' ',firstName) as Name, 
+    dateOfBirth,
+    JSON_OBJECT('id', cityId, 'name', COALESCE(cm.name, '')) AS city,
+    JSON_OBJECT('id', referralId, 'referralSource', COALESCE(rtm.name, '')) AS referralSource,
+    referralName,
+    (select pva.id from patient_visits_association pva where pva.patientId = pm.id and pva.isActive = 1 LIMIT 1) as activeVisitId,
+    COALESCE(
+        (
+            SELECT cdm.name 
+            FROM consultation_appointments_associations caa
+            INNER JOIN visit_consultations_associations vca ON vca.id = caa.consultationId
+            INNER JOIN patient_visits_association pva ON pva.id = vca.visitId
+            INNER JOIN consultation_doctor_master cdm ON cdm.userId = caa.consultationDoctorId
+            WHERE pva.patientId = pm.id
+            ORDER BY caa.appointmentDate DESC, caa.createdAt DESC
+            LIMIT 1
+        ),
+        (
+            SELECT cdm.name 
+            FROM treatment_appointments_associations taa
+            INNER JOIN visit_treatment_cycles_associations vtca ON vtca.id = taa.treatmentCycleId
+            INNER JOIN patient_visits_association pva ON pva.id = vtca.visitId
+            INNER JOIN consultation_doctor_master cdm ON cdm.userId = taa.consultationDoctorId
+            WHERE pva.patientId = pm.id
+            ORDER BY taa.appointmentDate DESC, taa.createdAt DESC
+            LIMIT 1
+        )
+    ) AS assignedDoctor,
+    COALESCE(
+        (
+            -- First priority: Get treatment from active visit
+            SELECT ttm.name
+            FROM visit_treatment_cycles_associations vtca
+            INNER JOIN patient_visits_association pva ON pva.id = vtca.visitId
+            INNER JOIN treatment_type_master ttm ON ttm.id = vtca.treatmentTypeId
+            WHERE pva.patientId = pm.id 
+              AND pva.isActive = 1
+            ORDER BY vtca.createdAt DESC
+            LIMIT 1
+        ),
+        (
+            -- Second priority: Get most recent completed treatment from any visit
+            SELECT ttm.name
+            FROM visit_treatment_cycles_associations vtca
+            INNER JOIN patient_visits_association pva ON pva.id = vtca.visitId
+            INNER JOIN treatment_type_master ttm ON ttm.id = vtca.treatmentTypeId
+            WHERE pva.patientId = pm.id
+            ORDER BY vtca.createdAt DESC
+            LIMIT 1
+        ),
+        '-'
+    ) AS plan,
+    COALESCE(
+        (
+            -- First priority: Get latest future appointment date from FollowUp Consultation in active visit
+            SELECT DATE_FORMAT(MAX(caa.appointmentDate), '%d-%m-%Y')
+            FROM consultation_appointments_associations caa
+            INNER JOIN visit_consultations_associations vca ON vca.id = caa.consultationId
+            INNER JOIN patient_visits_association pva ON pva.id = vca.visitId
+            WHERE pva.patientId = pm.id 
+              AND pva.isActive = 1
+              AND vca.type = 'FollowUp Consultation'
+              AND CAST(caa.appointmentDate AS DATE) >= CAST(CURRENT_DATE AS DATE)
+        ),
+        (
+            -- Second priority: Get latest future appointment date from FollowUp Consultation in any visit
+            SELECT DATE_FORMAT(MAX(caa.appointmentDate), '%d-%m-%Y')
+            FROM consultation_appointments_associations caa
+            INNER JOIN visit_consultations_associations vca ON vca.id = caa.consultationId
+            INNER JOIN patient_visits_association pva ON pva.id = vca.visitId
+            WHERE pva.patientId = pm.id
+              AND vca.type = 'FollowUp Consultation'
+              AND CAST(caa.appointmentDate AS DATE) >= CAST(CURRENT_DATE AS DATE)
+        ),
+        '-'
+    ) AS stageOfCycle
+    from patient_master pm 
+    LEFT JOIN patient_type_master ptm ON ptm.id = pm.patientTypeId 
+    LEFT JOIN city_master cm ON cm.id = pm.cityId
+    LEFT JOIN referral_type_master rtm ON rtm.id = pm.referralId
+) base
+`;
+
+const getPatientInfoForDischargeSheet = `
+SELECT
+	CONCAT(pm.lastName, ' ', COALESCE(pm.firstName,'')) as patientName,
+	COALESCE(pga.name,'') as husbandName,
+	CONCAT(YEAR(NOW()) - YEAR(pm.dateOfBirth)) AS patientAge,
+	COALESCE(pga.age, '') as husbandAge
+from
+	visit_treatment_cycles_associations vtca 
+LEFT JOIN ot_list_master olm ON
+	vtca.id = olm.treatmentCycleId
+INNER JOIN patient_visits_association pva ON pva.id  = vtca.visitId 
+INNER JOIN patient_master pm on pm.id  = pva.patientId 
+LEFT JOIN patient_guardian_associations pga on pga.patientId = pm.id 
+WHERE vtca.id  = :treatmentCycleId
+`;
+
+const getDischargeSummaryContextQuery = `
+SELECT
+    CONCAT(pm.lastName, ' ', COALESCE(pm.firstName,'')) AS patientName,
+    COALESCE(pga.name, '') AS husbandName,
+    CONCAT(YEAR(NOW()) - YEAR(pm.dateOfBirth)) AS patientAge,
+    COALESCE(pga.age, '') AS husbandAge,
+    COALESCE(
+        NULLIF(TRIM(vtca.type), ''),
+        (SELECT ttm.name FROM treatment_type_master ttm WHERE ttm.id = vtca.treatmentTypeId)
+    ) AS planOfCycle,
+    (
+        SELECT cdm.name
+        FROM treatment_appointments_associations taa
+        INNER JOIN consultation_doctor_master cdm ON cdm.userId = taa.consultationDoctorId
+        WHERE taa.treatmentCycleId = vtca.id
+        ORDER BY taa.appointmentDate DESC, taa.id DESC
+        LIMIT 1
+    ) AS doctorName,
+    (
+        SELECT u.fullName
+        FROM ot_list_master olm
+        INNER JOIN users u ON u.id = olm.embryologistId
+        WHERE olm.treatmentCycleId = vtca.id
+        ORDER BY olm.procedureDate DESC, olm.id DESC
+        LIMIT 1
+    ) AS embryologistName,
+    pva.visitClosedReason AS comments
+FROM visit_treatment_cycles_associations vtca
+INNER JOIN patient_visits_association pva ON pva.id = vtca.visitId
+INNER JOIN patient_master pm ON pm.id = pva.patientId
+LEFT JOIN patient_guardian_associations pga ON pga.patientId = pm.id
+WHERE vtca.id = :treatmentCycleId
+`;
+
+const getEmbryologyReportsByTreatmentCycleIdQuery = `
+SELECT
+    em.name AS embryologyName,
+    tea.categoryType,
+    tea.template,
+    taa.id AS appointmentId,
+    taa.appointmentDate,
+    (
+        SELECT cdm.name
+        FROM consultation_doctor_master cdm
+        WHERE cdm.userId = taa.consultationDoctorId
+        LIMIT 1
+    ) AS doctorName
+FROM treatment_appointments_associations taa
+INNER JOIN treatment_appointment_line_bills_associations talba
+    ON talba.appointmentId = taa.id
+    AND talba.billTypeId = 4
+    AND talba.status = 'PAID'
+INNER JOIN treatement_embryology_association tea
+    ON tea.treatmentCycleId = taa.id
+    AND tea.embryologyType = talba.billTypeValue
+INNER JOIN embryology_master em ON em.id = tea.embryologyType
+WHERE taa.treatmentCycleId = :treatmentCycleId
+ORDER BY taa.appointmentDate DESC, em.name ASC, tea.categoryType ASC
+`;
+
+const getPatientTreatmentCYclesQuery = `
+SELECT 
+	(SELECT bm.branchCode FROM branch_master bm WHERE bm.id = pm.branchId) AS branch,
+	pm.patientId AS patientId, 
+    CONCAT(pm.lastName, ' ', pm.firstName) AS patientName,
+    COALESCE(pm.firstName,'') as firstName,
+    pva.id AS visitId,
+    vtca.treatmentTypeId as treatmentTypeId,
+    (select ttm.treatmentCode  from treatment_type_master ttm where ttm.id = vtca.treatmentTypeId) as treatmentName,
+    
+    CASE 
+        WHEN vpa.registrationAmount = 0 THEN '-'
+        WHEN vpa.registrationDate IS NULL THEN 'Pending'
+        ELSE DATE_FORMAT(vpa.registrationDate, '%d-%m-%Y')
+    END AS registrationDate,
+
+    CASE 
+        WHEN vpa.day1Amount = 0 THEN '-'
+        WHEN vpa.day1Date IS NULL THEN 'Pending'
+        ELSE DATE_FORMAT(vpa.day1Date, '%d-%m-%Y')
+    END AS day1Date,
+    
+    CASE 
+        WHEN vtca.treatmentTypeId IN (4, 5) THEN
+            CASE 
+                WHEN vpa.day1Amount = 0 THEN '-'
+                WHEN vpa.day1Date IS NULL THEN 'Pending'
+                ELSE DATE_FORMAT(vpa.day1Date, '%d-%m-%Y')
+            END
+        ELSE '-'
+    END AS icsiD1,
+
+    CASE 
+        WHEN vpa.pickUpAmount = 0 THEN '-'
+        WHEN vpa.pickUpDate IS NULL THEN 'Pending'
+        ELSE DATE_FORMAT(vpa.pickUpDate, '%d-%m-%Y')
+    END AS pickUpDate,
+
+    CASE 
+        WHEN vpa.hysteroscopyAmount = 0 THEN '-'
+        WHEN vpa.hysteroscopyDate IS NULL THEN 'Pending'
+        ELSE DATE_FORMAT(vpa.hysteroscopyDate, '%d-%m-%Y')
+    END AS hysteroscopyDate,
+
+    CASE 
+        WHEN vpa.day5FreezingAmount = 0 THEN '-'
+        WHEN vpa.day5FreezingDate IS NULL THEN 'Pending'
+        ELSE DATE_FORMAT(vpa.day5FreezingDate, '%d-%m-%Y')
+    END AS day5FreezingDate,
+
+    CASE 
+        WHEN vpa.fetAmount = 0 THEN '-'
+        WHEN vpa.fetDate IS NULL THEN 'Pending'
+        ELSE DATE_FORMAT(vpa.fetDate, '%d-%m-%Y')
+    END AS fetDate,
+
+    CASE 
+        WHEN vpa.eraAmount = 0 THEN '-'
+        WHEN vpa.eraDate IS NULL THEN 'Pending'
+        ELSE DATE_FORMAT(vpa.eraDate, '%d-%m-%Y')
+    END AS eraDate,
+
+    CASE 
+        WHEN vpa.uptPositiveAmount = 0 THEN '-'
+        WHEN vpa.uptPositiveDate IS NULL THEN 'Pending'
+        ELSE DATE_FORMAT(vpa.uptPositiveDate, '%d-%m-%Y')
+    END AS uptPositiveDate
+
+FROM patient_master pm
+INNER JOIN patient_visits_association pva ON pva.patientId = pm.id 
+INNER JOIN visit_packages_associations vpa ON vpa.visitId = pva.id
+INNER JOIN visit_treatment_cycles_associations vtca ON vtca.visitId  = pva.id
+WHERE pva.isActive = 1
+`;
+
+const getPatientDetailsForOpdSheetQuery = `
+select 
+	JSON_OBJECT(
+		'date', CURRENT_DATE(),
+		'patientId', pm.patientId,
+		'patientName', CONCAT(pm.lastName, ' ', COALESCE(pm.firstName, '')),
+		'age', (YEAR(NOW()) - YEAR(pm.dateOfBirth)),
+		'maritalStatus', COALESCE(pm.maritalStatus,''),
+		'height', COALESCE(v.height,''),
+		'weight', COALESCE(v.weight,''),
+		'bmi', COALESCE(v.bmi,''),
+		'spouseBmiInformation', CONCAT(COALESCE(vs.spouseHeight, ''), ' ', COALESCE(vs.spouseWeight, ''), ' ', COALESCE(vs.spouseBmi, '')),
+        'spouseName', COALESCE((select pga.Name from patient_guardian_associations pga where pga.patientId = :patientId),'')
+	) as patientDetails
+from patient_master pm 
+LEFT JOIN (
+	SELECT
+		vaa.*
+	from
+		vitals_appointments_associations vaa
+	where vaa.appointmentDate = (
+	        SELECT MAX(v2.appointmentDate) 
+	        FROM vitals_appointments_associations v2 
+	        WHERE v2.patientId = vaa.patientId
+    	)
+) v ON v.patientId = (select pm.patientId from patient_master pm  where pm.id = :patientId)
+LEFT JOIN (
+	SELECT
+		vaa.*
+	from
+		vitals_appointments_associations vaa
+	where vaa.appointmentDate = (
+	        SELECT MAX(v2.appointmentDate) 
+	        FROM vitals_appointments_associations v2
+	        WHERE v2.patientId = vaa.patientId and (v2.spouseHeight  <> null or v2.spouseHeight <> '' or v2.spouseWeight <> null or v2.spouseWeight <> '')
+    	)
+) vs ON vs.patientId = (select pm.patientId from patient_master pm  where pm.id = :patientId)
+WHERE pm.id = :patientId
+`;
+
+const searchPatientByAadhaarQuery = `
+select
+	pm.*
+from
+	patient_master pm
+LEFT JOIN patient_guardian_associations pga on
+	pga.patientId = pm.id
+where
+	pm.patientId = :searchData
+	or pm.mobileNo = :searchData
+	or pm.aadhaarNo = :searchData
+	or pga.aadhaarNo = :searchData
+order by
+	case
+		when pm.patientId = :searchData then 1
+		when pm.mobileNo = :searchData then 2
+		when pm.aadhaarNo = :searchData then 3
+		when pga.aadhaarNo = :searchData then 4
+		else 5
+	end
+limit 1
+`;
+
+const getFutureCyclesQuery = `
+SELECT
+    pfc.id,
+    pfc.patientId AS patientMasterId,
+    pm.patientId,
+    pm.photoPath,
+    CONCAT(pm.lastName, ' ', pm.firstName) AS patientName,
+    pfc.cycleMonth,
+    pfc.cycleYear,
+    pm.mobileNo,
+    JSON_OBJECT('id', pm.cityId, 'name', COALESCE(cm.name, '')) AS city,
+    pm.branchId,
+    (SELECT bm.branchCode FROM branch_master bm WHERE bm.id = pm.branchId) AS branch,
+    (SELECT bm.name FROM branch_master bm WHERE bm.id = pm.branchId) AS branchName,
+    DATE_FORMAT(pfc.createdAt, '%d-%m-%Y') AS scheduledOn,
+    (
+        SELECT ttm.name
+        FROM visit_treatment_cycles_associations vtca
+        INNER JOIN patient_visits_association pva ON pva.id = vtca.visitId AND pva.isActive = 1
+        INNER JOIN treatment_type_master ttm ON ttm.id = vtca.treatmentTypeId
+        WHERE pva.patientId = pm.id
+        ORDER BY vtca.createdAt DESC, vtca.id DESC
+        LIMIT 1
+    ) AS treatmentType
+FROM patient_future_cycles pfc
+INNER JOIN patient_master pm ON pm.id = pfc.patientId
+LEFT JOIN city_master cm ON cm.id = pm.cityId
+WHERE 1=1
+`;
+
+const upsertFutureCycleQuery = `
+INSERT INTO patient_future_cycles (patientId, cycleMonth, cycleYear, createdBy)
+VALUES (:patientId, :cycleMonth, :cycleYear, :createdBy)
+ON DUPLICATE KEY UPDATE
+    cycleMonth = VALUES(cycleMonth),
+    cycleYear = VALUES(cycleYear),
+    createdBy = VALUES(createdBy),
+    updatedAt = CURRENT_TIMESTAMP
+`;
+
+const patientHasStartedTreatmentQuery = `
+SELECT EXISTS (
+    SELECT 1
+    FROM visit_treatment_cycles_associations vtca
+    INNER JOIN patient_visits_association pva ON pva.id = vtca.visitId
+    WHERE pva.patientId = :patientId
+      AND pva.isActive = 1
+) AS hasStartedTreatment
+`;
+
+const patientActiveTreatmentTypeQuery = `
+SELECT vtca.treatmentTypeId AS treatmentTypeId
+FROM visit_treatment_cycles_associations vtca
+INNER JOIN patient_visits_association pva ON pva.id = vtca.visitId
+WHERE pva.patientId = :patientId
+  AND pva.isActive = 1
+ORDER BY vtca.createdAt DESC, vtca.id DESC
+LIMIT 1
+`;
+
+module.exports = {
+  getDateFilteredPatientsQuery,
+  getPatientsQuery,
+  getPatientInfoForDischargeSheet,
+  getDischargeSummaryContextQuery,
+  getEmbryologyReportsByTreatmentCycleIdQuery,
+  getPatientTreatmentCYclesQuery,
+  getPatientDetailsForOpdSheetQuery,
+  searchPatientByAadhaarQuery,
+  getFutureCyclesQuery,
+  upsertFutureCycleQuery,
+  patientHasStartedTreatmentQuery,
+  patientActiveTreatmentTypeQuery
+};

@@ -1,0 +1,305 @@
+const createError = require("http-errors");
+const Constants = require("../constants/constants");
+const MySqlConnection = require("../connections/mysql_connection");
+const { Sequelize } = require("sequelize");
+const AWSConnection = require("../connections/aws_connection");
+const PaymentsMasterModel = require("../models/Master/paymentsMaster");
+const { getAllPaymentsQuery } = require("../queries/payments_queries");
+
+class PaymentsService {
+  constructor(request, response, next) {
+    this._request = request;
+    this._response = response;
+    this._next = next;
+    this.mysqlConnection = MySqlConnection._instance;
+    this.s3 = AWSConnection.getS3();
+    this.bucketName = AWSConnection.getS3BucketName();
+    this.currentUserId = this._request?.userDetails?.id;
+  }
+
+  async uploadFileToS3(file, paymentId, fileType) {
+    try {
+      const fileExtension = file.originalname.split(".").pop();
+      const uniqueFileName = `${fileType}_${paymentId}_${Date.now()}.${fileExtension}`;
+      const key = `payments/${paymentId}/${fileType}/${uniqueFileName}`;
+
+      const uploadParams = {
+        Bucket: this.bucketName,
+        Key: key,
+        Body: file.buffer,
+        ContentType: file.mimetype
+      };
+
+      const uploadResult = await this.s3.upload(uploadParams).promise();
+      return uploadResult.Location;
+    } catch (err) {
+      console.log(`Error while uploading ${fileType} to S3:`, err);
+      throw new Error(`Error while uploading ${fileType}`);
+    }
+  }
+
+  async createPaymentService() {
+    const {
+      branchId,
+      paymentDate,
+      invoiceDate,
+      departmentId,
+      vendorId,
+      amount
+    } = this._request.body;
+
+    if (
+      !branchId ||
+      !paymentDate ||
+      !invoiceDate ||
+      !departmentId ||
+      !vendorId ||
+      !amount
+    ) {
+      throw new createError.BadRequest("Missing required fields");
+    }
+
+    return await this.mysqlConnection.transaction(async t => {
+      // Create payment record
+      const payment = await PaymentsMasterModel.create(
+        {
+          branchId: parseInt(branchId),
+          paymentDate,
+          invoiceDate: invoiceDate || null,
+          departmentId: parseInt(departmentId),
+          vendorId: parseInt(vendorId),
+          amount: parseFloat(amount),
+          createdBy: this.currentUserId
+        },
+        { transaction: t }
+      ).catch(err => {
+        console.log("Error while creating payment", err.message);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+      let invoiceUrl = null;
+      let receiptUrl = null;
+
+      // Upload invoice file if provided
+      if (this._request?.files && this._request?.files?.invoiceFile) {
+        const invoiceFile = Array.isArray(this._request.files.invoiceFile)
+          ? this._request.files.invoiceFile[0]
+          : this._request.files.invoiceFile;
+        invoiceUrl = await this.uploadFileToS3(
+          invoiceFile,
+          payment.id,
+          "invoice"
+        );
+      }
+
+      // Upload receipt file if provided
+      if (this._request?.files && this._request?.files?.receiptFile) {
+        const receiptFile = Array.isArray(this._request.files.receiptFile)
+          ? this._request.files.receiptFile[0]
+          : this._request.files.receiptFile;
+        receiptUrl = await this.uploadFileToS3(
+          receiptFile,
+          payment.id,
+          "receipt"
+        );
+      }
+
+      // Update payment with file URLs if files were uploaded
+      if (invoiceUrl || receiptUrl) {
+        await PaymentsMasterModel.update(
+          {
+            ...(invoiceUrl && { invoiceUrl }),
+            ...(receiptUrl && { receiptUrl })
+          },
+          {
+            where: { id: payment.id },
+            transaction: t
+          }
+        ).catch(err => {
+          console.log(
+            "Error while updating payment with file URLs",
+            err.message
+          );
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+      }
+
+      // Fetch the created payment with all details
+      const getPaymentByIdQuery = getAllPaymentsQuery.replace(
+        "ORDER BY p.createdAt DESC",
+        `WHERE p.id = :paymentId ORDER BY p.createdAt DESC`
+      );
+      const createdPayment = await this.mysqlConnection.query(
+        getPaymentByIdQuery,
+        {
+          type: Sequelize.QueryTypes.SELECT,
+          replacements: { paymentId: payment.id }
+        }
+      );
+
+      return createdPayment[0] || payment;
+    });
+  }
+
+  async getAllPaymentsService() {
+    try {
+      const {
+        branchId,
+        departmentId,
+        vendorId,
+        amount,
+        paymentDate,
+        invoiceDate,
+        fromDate,
+        toDate
+      } = this._request.query;
+
+      let query = getAllPaymentsQuery.replace("ORDER BY p.createdAt DESC;", "");
+      const whereConditions = [];
+      const replacements = {};
+
+      if (branchId && String(branchId).trim() !== "") {
+        whereConditions.push("p.branchId = :branchId");
+        replacements.branchId = String(branchId).trim();
+      }
+      if (departmentId && String(departmentId).trim() !== "") {
+        whereConditions.push("p.departmentId = :departmentId");
+        replacements.departmentId = String(departmentId).trim();
+      }
+      if (vendorId && String(vendorId).trim() !== "") {
+        whereConditions.push("p.vendorId = :vendorId");
+        replacements.vendorId = String(vendorId).trim();
+      }
+      if (amount && String(amount).trim() !== "") {
+        whereConditions.push("p.amount = :amount");
+        replacements.amount = Number(amount);
+      }
+      if (paymentDate && String(paymentDate).trim() !== "") {
+        whereConditions.push("DATE(p.paymentDate) = :paymentDate");
+        replacements.paymentDate = String(paymentDate).trim();
+      }
+      if (invoiceDate && String(invoiceDate).trim() !== "") {
+        whereConditions.push("DATE(p.invoiceDate) = :invoiceDate");
+        replacements.invoiceDate = String(invoiceDate).trim();
+      }
+      const hasFromDate = fromDate && String(fromDate).trim() !== "";
+      const hasToDate = toDate && String(toDate).trim() !== "";
+      if (hasFromDate) {
+        replacements.fromDate = String(fromDate).trim();
+      }
+      if (hasToDate) {
+        replacements.toDate = String(toDate).trim();
+      }
+      // At least one of paymentDate/invoiceDate must match the chosen range.
+      if (hasFromDate && hasToDate) {
+        whereConditions.push(
+          "((DATE(p.paymentDate) BETWEEN :fromDate AND :toDate) OR (DATE(p.invoiceDate) BETWEEN :fromDate AND :toDate))"
+        );
+      } else if (hasFromDate) {
+        whereConditions.push(
+          "((DATE(p.paymentDate) >= :fromDate) OR (DATE(p.invoiceDate) >= :fromDate))"
+        );
+      } else if (hasToDate) {
+        whereConditions.push(
+          "((DATE(p.paymentDate) <= :toDate) OR (DATE(p.invoiceDate) <= :toDate))"
+        );
+      }
+
+      if (whereConditions.length > 0) {
+        query += ` WHERE ${whereConditions.join(" AND ")}`;
+      }
+      query += " ORDER BY p.createdAt DESC";
+
+      return await this.mysqlConnection.query(query, {
+        type: Sequelize.QueryTypes.SELECT,
+        replacements
+      });
+    } catch (err) {
+      console.log("Error while fetching all payments", err);
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    }
+  }
+
+  async updatePaymentFilesService() {
+    const { paymentId } = this._request.params;
+
+    if (!paymentId) {
+      throw new createError.BadRequest("Payment ID is required");
+    }
+
+    // Check if payment exists
+    const payment = await PaymentsMasterModel.findByPk(paymentId);
+    if (!payment) {
+      throw new createError.NotFound("Payment not found");
+    }
+
+    return await this.mysqlConnection.transaction(async t => {
+      let invoiceUrl = payment.invoiceUrl;
+      let receiptUrl = payment.receiptUrl;
+
+      // Upload invoice file if provided
+      if (this._request?.files && this._request?.files?.invoiceFile) {
+        const invoiceFile = Array.isArray(this._request.files.invoiceFile)
+          ? this._request.files.invoiceFile[0]
+          : this._request.files.invoiceFile;
+        invoiceUrl = await this.uploadFileToS3(
+          invoiceFile,
+          parseInt(paymentId),
+          "invoice"
+        );
+      }
+
+      // Upload receipt file if provided
+      if (this._request?.files && this._request?.files?.receiptFile) {
+        const receiptFile = Array.isArray(this._request.files.receiptFile)
+          ? this._request.files.receiptFile[0]
+          : this._request.files.receiptFile;
+        receiptUrl = await this.uploadFileToS3(
+          receiptFile,
+          parseInt(paymentId),
+          "receipt"
+        );
+      }
+
+      // Update payment with file URLs
+      await PaymentsMasterModel.update(
+        {
+          ...(invoiceUrl && { invoiceUrl }),
+          ...(receiptUrl && { receiptUrl })
+        },
+        {
+          where: { id: parseInt(paymentId) },
+          transaction: t
+        }
+      ).catch(err => {
+        console.log("Error while updating payment files", err.message);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+      // Fetch the updated payment with all details
+      const getPaymentByIdQuery = getAllPaymentsQuery.replace(
+        "ORDER BY p.createdAt DESC",
+        `WHERE p.id = :paymentId ORDER BY p.createdAt DESC`
+      );
+      const updatedPayment = await this.mysqlConnection.query(
+        getPaymentByIdQuery,
+        {
+          type: Sequelize.QueryTypes.SELECT,
+          replacements: { paymentId: parseInt(paymentId) }
+        }
+      );
+
+      return updatedPayment[0] || payment;
+    });
+  }
+}
+
+module.exports = PaymentsService;

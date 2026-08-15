@@ -1,0 +1,1582 @@
+const { Sequelize } = require("sequelize");
+const MySqlConnection = require("../connections/mysql_connection");
+const Constants = require("../constants/constants");
+const createError = require("http-errors");
+const lodash = require("lodash");
+const {
+  isActiveQuery,
+  getDonarInformationQuery,
+  isPackageExistsQueryForTreatment,
+  UpdateActiveQuery,
+  donorPaymentCheckQuery
+} = require("../queries/visit_queries");
+const patientVisitsAssociation = require("../models/Associations/patientVisitsAssociation");
+const { assertPackageEditAllowed } = require("../constants/packageEditAccess");
+const {
+  createVisitSchema,
+  editVisitSchema,
+  createConsultationOrTreatmentSchema,
+  createPackageSchema,
+  editPackageSchema,
+  applyDiscountForPackageSchema,
+  saveDonarSchema,
+  editDonarSchema,
+  closeVisitSchema,
+  closeVisitByConsultationSchema,
+  deleteDonorFileSchema,
+  saveHysteroscopySchema,
+  saveVisitLmpEddSchema
+} = require("../schemas/visitSchema");
+const visitConsultationsAssociations = require("../models/Associations/visitConsultationsAssociations");
+const visitTreatmentsAssociations = require("../models/Associations/visitTreatmentsAssociations");
+const VisitPackagesAssociation = require("../models/Associations/visitPackagesAssociation");
+const treatmentTypes = require("../constants/treatmentTypes");
+const VisitDonarsAssociation = require("../models/Associations/visitDonarsAssociation");
+const AWSConnection = require("../connections/aws_connection");
+const AppointmentsPaymentService = require("./appointmentPaymentsService");
+const BloodGroupMaster = require("../models/Master/bloodGroupMaster");
+const PatientMasterModel = require("../models/Master/patientMaster");
+const VisitHysteroscopyAssociations = require("../models/Associations/visitHysteroscopyAssociations");
+const VisitHysteroscopyReferenceImages = require("../models/Associations/visitHysteroscopyReferenceImages");
+const ConsultationAppointmentAssociations = require("../models/Associations/consultationAppointmentsAssociations");
+const TreatmentAppointmentAssociations = require("../models/Associations/treatmentAppointmentAssociations");
+const consultationAppointmentLineBillsAssociations = require("../models/Associations/consultationAppointmentLineBillsAssociations");
+const treatmentAppointmentLineBillsAssociations = require("../models/Associations/treatmentAppointmentLineBillsAssociations");
+const consultationAppointmentNotesAssociations = require("../models/Associations/consultationAppointmentNotesAssociations");
+const treatmentAppointmentNotesAssociations = require("../models/Associations/treatmentAppointmentNotesAssociations");
+class VisitsService {
+  constructor(request, response, next) {
+    this._request = request;
+    this._response = response;
+    this._next = next;
+    this.mysqlConnection = MySqlConnection._instance;
+    this.s3 = AWSConnection.getS3();
+    this.bucketName = AWSConnection.getS3BucketName();
+  }
+
+  async checkIsActiveVisit(patientId) {
+    const checkActive = await this.mysqlConnection
+      .query(isActiveQuery, {
+        type: Sequelize.QueryTypes.SELECT,
+        replacements: {
+          patientId: patientId
+        }
+      })
+      .catch(err => {
+        console.log(
+          "Error while updating checking isActive visit Details",
+          err.message
+        );
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+    return checkActive[0].activeCount;
+  }
+
+  async createVisitService() {
+    const createdBy = this._request.userDetails?.id;
+    const validatedVisitData = await createVisitSchema.validateAsync(
+      this._request.body
+    );
+    validatedVisitData.createdBy = createdBy;
+    const checkIsActiveVisit = await this.checkIsActiveVisit(
+      validatedVisitData.patientId
+    );
+    if (checkIsActiveVisit > 0) {
+      throw new createError.BadRequest(Constants.VISIT_ALREADY_EXIST);
+    }
+    validatedVisitData.isActive = true;
+    return await this.mysqlConnection.transaction(async t => {
+      const newVisit = await patientVisitsAssociation
+        .create(validatedVisitData, {
+          transaction: t
+        })
+        .catch(err => {
+          console.log("Error while creating new visit", err.message);
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+
+      // Update the patient VisitType With new One
+      await PatientMasterModel.update(
+        {
+          patientTypeId: validatedVisitData?.type // new visitid
+        },
+        {
+          where: {
+            id: validatedVisitData?.patientId
+          },
+          transaction: t
+        }
+      );
+      return newVisit.dataValues;
+    });
+  }
+
+  async editVisitService() {
+    const validatedVisitData = await editVisitSchema.validateAsync(
+      this._request.body
+    );
+
+    await patientVisitsAssociation
+      .update(validatedVisitData, { where: { id: validatedVisitData.id } })
+      .catch(err => {
+        console.log("Error while creating new visit", err.message);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    return Constants.VISIT_SUCCESSFULLY_UPDATED;
+  }
+
+  async saveVisitLmpEddService() {
+    const validatedData = await saveVisitLmpEddSchema.validateAsync(
+      this._request.body
+    );
+
+    const visit = await patientVisitsAssociation
+      .findOne({ where: { id: validatedData.visitId } })
+      .catch(err => {
+        console.log("Error while fetching visit for LMP/EDD", err.message);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    if (!visit) {
+      throw new createError.BadRequest(Constants.VISIT_DOES_NOT_EXIST);
+    }
+
+    if (!visit.isActive) {
+      throw new createError.BadRequest(
+        "LMP and EDD can only be updated while the visit is active"
+      );
+    }
+
+    const visitTypeRows = await this.mysqlConnection
+      .query(
+        `SELECT name FROM visit_type_master WHERE id = :visitTypeId LIMIT 1`,
+        {
+          type: Sequelize.QueryTypes.SELECT,
+          replacements: { visitTypeId: visit.type }
+        }
+      )
+      .catch(err => {
+        console.log("Error while fetching visit type for LMP/EDD", err.message);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    const visitTypeName = String(visitTypeRows?.[0]?.name || "").toLowerCase();
+    const isAntenatal =
+      Number(visit.type) === 2 || visitTypeName.includes("antenatal");
+
+    if (!isAntenatal) {
+      throw new createError.BadRequest(
+        "LMP and EDD can only be saved for antenatal visits"
+      );
+    }
+
+    await visit
+      .update({
+        lmp: validatedData.lmp,
+        edd: validatedData.edd
+      })
+      .catch(err => {
+        console.log("Error while saving visit LMP/EDD", err.message);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    return {
+      visitId: visit.id,
+      lmp: validatedData.lmp,
+      edd: validatedData.edd
+    };
+  }
+
+  async getVisitService() {
+    const paramPatientId = Number(this._request.params.patientId);
+    const getVisitQuery = `select * from patient_visits_association pva where pva.patientId=:patientId`;
+    const visitData = await this.mysqlConnection
+      .query(getVisitQuery, {
+        type: Sequelize.QueryTypes.SELECT,
+        replacements: {
+          patientId: paramPatientId
+        }
+      })
+      .catch(err => {
+        console.log("Error while getting visits for patient", err.message);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    return visitData;
+  }
+
+  async closeVisitService() {
+    const paramVisitId = Number(this._request.params.visitId);
+    const validatedVisitData = await closeVisitSchema.validateAsync(
+      this._request.body
+    );
+    if (validatedVisitData?.type.toLowerCase() == "consultation") {
+      throw new createError.BadRequest("Cant close visit for Consultation");
+    }
+    const visitExist = await patientVisitsAssociation
+      .findOne({ where: { id: paramVisitId } })
+      .catch(err => {
+        console.log("Error while getting visit exist check", err.message);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+    if (!visitExist) {
+      throw new createError.BadRequest(Constants.VISIT_DOES_NOT_EXIST);
+    }
+    if (!visitExist?.isActive) {
+      throw new createError.BadRequest(Constants.NO_ACTIVE_VISIT_EXIST);
+    }
+
+    await this.mysqlConnection.transaction(async t => {
+      /* TODO: Check if Pending payments exists for visitId after payment flow */
+
+      // //check isPackageExists or not
+      // const isPackageExistData = await this.mysqlConnection
+      //   .query(isPackageExistsQueryForTreatment, {
+      //     type: Sequelize.QueryTypes.SELECT,
+      //     replacements: {
+      //       treatmentCycleId: validatedVisitData?.treatmentCycleId
+      //     },
+      //     transaction: t
+      //   })
+      //   .catch(err => {
+      //     console.log(
+      //       "Error while getting packageExists Data for patient",
+      //       err.message
+      //     );
+      //     throw new createError.InternalServerError(
+      //       Constants.SOMETHING_ERROR_OCCURRED
+      //     );
+      //   });
+
+      // //check pending payments
+      // const appointmentPaymentServiceObj = new AppointmentsPaymentService(
+      //   this._request,
+      //   this._response,
+      //   this._next
+      // );
+      // if (isPackageExistData[0].isPackageExists) {
+      //   console.log("red:", isPackageExistData[0].isPackageExists);
+      //   const packagePayments = await appointmentPaymentServiceObj.getPendingPaymentAmountForPackageService(
+      //     validatedVisitData?.patientId,
+      //     new Date().toISOString().split("T")[0]
+      //   );
+      //   console.log("packagePayments:", packagePayments);
+      //   if (packagePayments?.totalPendingAmount > 0) {
+      //     throw new createError.BadRequest(
+      //       Constants.PENDING_PAYMENTS_FOR_VISIT_CLOSE
+      //     );
+      //   }
+      // } else {
+      //   const withoutPackagePayments = await appointmentPaymentServiceObj.getPendingPaymentWithoutPackageService(
+      //     validatedVisitData?.type,
+      //     validatedVisitData?.appointmentId
+      //   );
+      //   console.log("withoutPackagePayments:", withoutPackagePayments);
+      //   if (withoutPackagePayments?.totalPendingAmount > 0) {
+      //     throw new createError.BadRequest(
+      //       Constants.PENDING_PAYMENTS_FOR_VISIT_CLOSE
+      //     );
+      //   }
+      // }
+
+      // update closing visit
+      const closedBy = this._request.userDetails?.id;
+      await this.mysqlConnection
+        .query(UpdateActiveQuery, {
+          type: Sequelize.QueryTypes.UPDATE,
+          replacements: {
+            visitId: paramVisitId,
+            visitClosedStatus: validatedVisitData?.visitClosedStatus,
+            visitClosedReason: validatedVisitData?.visitClosedReason,
+            closedBy: closedBy
+          },
+          transaction: t
+        })
+        .catch(err => {
+          console.log("Error while updating visits isActive", err.message);
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+    });
+    return Constants.VISIT_CLOSED_SUCCESSFULLY;
+  }
+
+  async closeVisitByConsultationService() {
+    const paramVisitId = Number(this._request.params.visitId);
+    const validatedVisitData = await closeVisitByConsultationSchema.validateAsync(
+      this._request.body
+    );
+    if (validatedVisitData?.type.toLowerCase() == "treatment") {
+      throw new createError.BadRequest("Cant close visit for Treatment");
+    }
+    const visitExist = await patientVisitsAssociation
+      .findOne({ where: { id: paramVisitId } })
+      .catch(err => {
+        console.log("Error while getting visit exist check", err.message);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+    if (!visitExist) {
+      throw new createError.BadRequest(Constants.VISIT_DOES_NOT_EXIST);
+    }
+    if (!visitExist?.isActive) {
+      throw new createError.BadRequest(Constants.NO_ACTIVE_VISIT_EXIST);
+    }
+
+    await this.mysqlConnection.transaction(async t => {
+      // check if treatment exists for visitId
+      const existingVisitTreatments = await visitTreatmentsAssociations
+        .findAll({
+          where: { visitId: paramVisitId }
+        })
+        .catch(err => {
+          console.log("Error while getting visit treatments:", err.message);
+          throw new createError.InternalServerError(err.message);
+        });
+
+      if (!lodash.isEmpty(existingVisitTreatments)) {
+        throw new createError.BadRequest(
+          Constants.TREATMENT_EXISTS_CLOSE_IN_TREATMENT
+        );
+      }
+
+      // update closing visit
+      const closedBy = this._request.userDetails?.id;
+      await this.mysqlConnection
+        .query(UpdateActiveQuery, {
+          type: Sequelize.QueryTypes.UPDATE,
+          replacements: {
+            visitId: paramVisitId,
+            visitClosedStatus: validatedVisitData?.visitClosedStatus,
+            visitClosedReason: validatedVisitData?.visitClosedReason,
+            closedBy: closedBy
+          },
+          transaction: t
+        })
+        .catch(err => {
+          console.log("Error while updating visits isActive", err.message);
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+    });
+    return Constants.VISIT_CLOSED_SUCCESSFULLY;
+  }
+
+  async runOptionalAppointmentMigrationQuery(query, replacements, transaction) {
+    try {
+      await this.mysqlConnection.query(query, {
+        replacements,
+        transaction
+      });
+    } catch (err) {
+      console.log("Optional appointment migration skipped:", err.message);
+    }
+  }
+
+  async cleanupConsultationAppointmentDependencies(
+    oldAppointmentId,
+    newAppointmentId,
+    transaction
+  ) {
+    const replacements = { oldAppointmentId, newAppointmentId };
+    const cleanupQueries = [
+      `
+        INSERT INTO treatment_appointment_labtests_associations
+          (appointmentId, labTests, isDone, CreatedBy, createdAt, updatedAt)
+        SELECT :newAppointmentId, labTests, isDone, CreatedBy, createdAt, updatedAt
+        FROM consultation_appointment_labtests_associations
+        WHERE appointmentId = :oldAppointmentId
+      `,
+      `DELETE FROM consultation_appointment_labtests_associations WHERE appointmentId = :oldAppointmentId`,
+      `
+        INSERT INTO treatment_appointment_pharmacy_associations
+          (appointmentId, medicinesList, isDone, CreatedBy, createdAt, updatedAt)
+        SELECT :newAppointmentId, medicinesList, isDone, CreatedBy, createdAt, updatedAt
+        FROM consultation_appointment_pharmacy_associations
+        WHERE appointmentId = :oldAppointmentId
+      `,
+      `DELETE FROM consultation_appointment_pharmacy_associations WHERE appointmentId = :oldAppointmentId`,
+      `
+        INSERT INTO treatment_payments_associations
+          (appointmentId, billType, totalAmount, totalAmountPaid, createdBy)
+        SELECT :newAppointmentId, billType, totalAmount, totalAmountPaid, createdBy
+        FROM consultation_payments_associations
+        WHERE appointmentId = :oldAppointmentId
+      `,
+      `DELETE FROM consultation_payments_associations WHERE appointmentId = :oldAppointmentId`,
+      `
+        UPDATE lab_test_results
+        SET appointmentId = :newAppointmentId, type = 'Treatment'
+        WHERE appointmentId = :oldAppointmentId
+      `,
+      `
+        UPDATE scan_results
+        SET appointmentId = :newAppointmentId, type = 'Treatment'
+        WHERE appointmentId = :oldAppointmentId
+      `,
+      `
+        UPDATE patient_scan_formf_associations
+        SET appointmentId = :newAppointmentId, type = 'Treatment'
+        WHERE appointmentId = :oldAppointmentId
+      `,
+      `
+        UPDATE order_details_master
+        SET appointmentId = :newAppointmentId, type = 'TREATMENT'
+        WHERE appointmentId = :oldAppointmentId
+      `,
+      `
+        UPDATE vitals_appointments_associations
+        SET appointmentId = :newAppointmentId, type = 'Treatment'
+        WHERE appointmentId = :oldAppointmentId AND type = 'Consultation'
+      `,
+      `DELETE FROM consultation_embryology_association WHERE consultationId = :oldAppointmentId`,
+      `DELETE FROM consultation_appointment_line_bills_associations WHERE appointmentId = :oldAppointmentId`,
+      `DELETE FROM consultation_appointment_notes_associations WHERE appointmentId = :oldAppointmentId`
+    ];
+
+    for (const query of cleanupQueries) {
+      await this.runOptionalAppointmentMigrationQuery(
+        query,
+        replacements,
+        transaction
+      );
+    }
+  }
+
+  async copyConsultationLineBillsToTreatment(
+    oldAppointmentId,
+    newAppointmentId,
+    transaction
+  ) {
+    const consultationLineBills = await consultationAppointmentLineBillsAssociations
+      .findAll({
+        where: { appointmentId: oldAppointmentId },
+        transaction
+      })
+      .catch(err => {
+        console.log(
+          "Error while fetching consultation line bills",
+          err.message
+        );
+        return [];
+      });
+
+    for (const bill of consultationLineBills) {
+      const {
+        id,
+        appointmentId,
+        createdAt,
+        updatedAt,
+        billTypeId,
+        billTypeValue,
+        prescribedQuantity,
+        purchaseQuantity,
+        returnQuantity,
+        prescriptionDetails,
+        prescriptionDays,
+        isSpouse,
+        status,
+        createdBy
+      } = bill.dataValues;
+      await treatmentAppointmentLineBillsAssociations
+        .create(
+          {
+            appointmentId: newAppointmentId,
+            billTypeId,
+            billTypeValue,
+            prescribedQuantity: prescribedQuantity ?? 1,
+            purchaseQuantity,
+            returnQuantity,
+            prescriptionDetails,
+            prescriptionDays,
+            isSpouse,
+            status,
+            createdBy
+          },
+          { transaction }
+        )
+        .catch(err => {
+          console.log(
+            "Error while copying consultation line bill",
+            err.message
+          );
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+    }
+
+    if (consultationLineBills.length > 0) {
+      await consultationAppointmentLineBillsAssociations.destroy({
+        where: { appointmentId: oldAppointmentId },
+        transaction
+      });
+    }
+  }
+
+  async copyConsultationNotesToTreatment(
+    oldAppointmentId,
+    newAppointmentId,
+    transaction
+  ) {
+    const consultationNotes = await consultationAppointmentNotesAssociations
+      .findAll({
+        where: { appointmentId: oldAppointmentId },
+        transaction
+      })
+      .catch(err => {
+        console.log("Error while fetching consultation notes", err.message);
+        return [];
+      });
+
+    for (const note of consultationNotes) {
+      const {
+        id,
+        appointmentId,
+        createdAt,
+        updatedAt,
+        ...noteData
+      } = note.dataValues;
+      await treatmentAppointmentNotesAssociations
+        .create(
+          {
+            ...noteData,
+            appointmentId: newAppointmentId,
+            isDone: noteData.isDone ?? 0
+          },
+          { transaction }
+        )
+        .catch(err => {
+          console.log("Error while copying consultation note", err.message);
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+    }
+
+    if (consultationNotes.length > 0) {
+      await consultationAppointmentNotesAssociations.destroy({
+        where: { appointmentId: oldAppointmentId },
+        transaction
+      });
+    }
+  }
+
+  async convertConsultationAppointmentToTreatment(
+    consultationAppointmentId,
+    treatmentCycleId,
+    visitId,
+    transaction
+  ) {
+    const consultationRows = await this.mysqlConnection.query(
+      `
+        SELECT caa.*, vca.visitId AS linkedVisitId
+        FROM consultation_appointments_associations caa
+        LEFT JOIN visit_consultations_associations vca ON vca.id = caa.consultationId
+        WHERE caa.id = :consultationAppointmentId
+        LIMIT 1
+      `,
+      {
+        type: Sequelize.QueryTypes.SELECT,
+        replacements: { consultationAppointmentId },
+        transaction
+      }
+    );
+
+    if (lodash.isEmpty(consultationRows)) {
+      throw new createError.BadRequest(
+        "Consultation appointment not found for this visit"
+      );
+    }
+
+    const consultationData = consultationRows[0];
+    if (
+      consultationData.linkedVisitId &&
+      Number(consultationData.linkedVisitId) !== Number(visitId)
+    ) {
+      throw new createError.BadRequest(
+        "Consultation appointment does not belong to this visit"
+      );
+    }
+
+    const treatmentAppointment = await TreatmentAppointmentAssociations.create(
+      {
+        treatmentCycleId,
+        branchId: consultationData.branchId,
+        appointmentDate: consultationData.appointmentDate,
+        consultationDoctorId: consultationData.consultationDoctorId,
+        timeStart: consultationData.timeStart,
+        timeEnd: consultationData.timeEnd,
+        appointmentReasonId: consultationData.appointmentReasonId,
+        createdBy: consultationData.createdBy,
+        isSeen: consultationData.isSeen,
+        seenAt: consultationData.seenAt,
+        isDone: consultationData.isDone,
+        doneAt: consultationData.doneAt,
+        isArrived: consultationData.isArrived,
+        arrivedAt: consultationData.arrivedAt,
+        isScan: consultationData.isScan,
+        scanAt: consultationData.scanAt,
+        isDoctor: consultationData.isDoctor,
+        doctorAt: consultationData.doctorAt,
+        stage: consultationData.stage,
+        appointmentType: consultationData.appointmentType,
+        noShow: consultationData.noShow,
+        noShowReason: consultationData.noShowReason,
+        isCompleted: consultationData.isCompleted,
+        isReviewAppointmentCreated: consultationData.isReviewAppointmentCreated
+      },
+      { transaction }
+    ).catch(err => {
+      console.log(
+        "Error while creating treatment appointment from consultation",
+        err.message
+      );
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    });
+
+    const oldAppointmentId = consultationAppointmentId;
+    const newAppointmentId = treatmentAppointment.id;
+
+    await this.copyConsultationLineBillsToTreatment(
+      oldAppointmentId,
+      newAppointmentId,
+      transaction
+    );
+    await this.copyConsultationNotesToTreatment(
+      oldAppointmentId,
+      newAppointmentId,
+      transaction
+    );
+    await this.cleanupConsultationAppointmentDependencies(
+      oldAppointmentId,
+      newAppointmentId,
+      transaction
+    );
+
+    await ConsultationAppointmentAssociations.destroy({
+      where: { id: oldAppointmentId },
+      transaction
+    }).catch(err => {
+      console.log(
+        "Error while removing converted consultation appointment",
+        err.message
+      );
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    });
+
+    return newAppointmentId;
+  }
+
+  async createConsultationOrTreatmentService() {
+    const createdByUserId = this._request?.userDetails?.id;
+    const validatedInfoData = await createConsultationOrTreatmentSchema.validateAsync(
+      this._request.body
+    );
+    const { createType, visitId, packageAmount, type } = validatedInfoData;
+    if (createType === "Consultation") {
+      const ExistsInitialConsultation = `select vca.id,vca.type from defaultdb.visit_consultations_associations vca 
+          INNER JOIN defaultdb.patient_visits_association pva ON vca.visitId = pva.id where pva.id=:visitId`;
+      const getData = await this.mysqlConnection
+        .query(ExistsInitialConsultation, {
+          type: Sequelize.QueryTypes.SELECT,
+          replacements: {
+            visitId: visitId
+          }
+        })
+        .catch(err => {
+          console.log("Error while getting consultation details", err);
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+      const hasInitialConsultation = getData.some(
+        item => item.type === "Initial Consultation"
+      );
+
+      if (type === "Intial Consultation" && hasInitialConsultation) {
+        throw new createError.InternalServerError(
+          "Initial Consultation Already exists!"
+        );
+      }
+    }
+    const dataPassed = {
+      visitId: validatedInfoData.visitId,
+      type: validatedInfoData.type,
+      createdBy: createdByUserId
+    };
+    if (createType === "Consultation") {
+      const consultationRecord = await visitConsultationsAssociations
+        .create(dataPassed)
+        .catch(err => {
+          console.log(
+            "Error while creating new visitConsultationsAssociations record",
+            err.message
+          );
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+
+      return consultationRecord.dataValues;
+    } else if (createType === "Treatment") {
+      const isTreatmentExistsForVisit = await visitTreatmentsAssociations
+        .findOne({
+          where: {
+            visitId: visitId
+          }
+        })
+        .catch(err => {
+          console.log("Error while finding the treatement details", err);
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+
+      if (!lodash.isEmpty(isTreatmentExistsForVisit)) {
+        throw new createError.BadRequest(
+          Constants.TREATMENT_ALREADY_EXISTS_FOR_THIS_VISIT
+        );
+      }
+
+      const consultationAppointmentId =
+        validatedInfoData?.consultationAppointmentId;
+
+      return await this.mysqlConnection.transaction(async transaction => {
+        const treatmentRecord = await visitTreatmentsAssociations
+          .create(
+            {
+              ...dataPassed,
+              treatmentTypeId: validatedInfoData?.treatmentTypeId
+            },
+            { transaction }
+          )
+          .catch(err => {
+            console.log(
+              "Error while creating new visitTreatmentsAssociations record",
+              err.message
+            );
+            throw new createError.InternalServerError(
+              Constants.SOMETHING_ERROR_OCCURRED
+            );
+          });
+
+        const selectedTreatmentTypeConfig =
+          treatmentTypes[(validatedInfoData?.treatmentTypeId)];
+        const isPackageRequired = !!selectedTreatmentTypeConfig?.isPackageExists;
+        if (validatedInfoData?.treatmentTypeId && isPackageRequired) {
+          const normalizedPackageAmount = Number(packageAmount);
+          if (
+            !Number.isFinite(normalizedPackageAmount) ||
+            normalizedPackageAmount <= 0
+          ) {
+            throw new createError.BadRequest(Constants.PACKAGE_AMOUNT_REQUIRED);
+          }
+
+          const isPackageExist = await VisitPackagesAssociation.findOne({
+            where: {
+              visitId: visitId
+            },
+            transaction
+          });
+
+          if (isPackageExist) {
+            throw new createError.Conflict(
+              Constants.PACKAGE_ALREADY_EXIST_FOR_VISIT
+            );
+          }
+
+          await VisitPackagesAssociation.create(
+            {
+              visitId,
+              doctorSuggestedPackage: normalizedPackageAmount,
+              registrationDate: null
+            },
+            { transaction }
+          ).catch(err => {
+            console.log("Error while creating automatic package", err);
+            throw new createError.InternalServerError(
+              Constants.SOMETHING_ERROR_OCCURRED
+            );
+          });
+        }
+
+        let convertedAppointmentId = null;
+        if (consultationAppointmentId) {
+          convertedAppointmentId = await this.convertConsultationAppointmentToTreatment(
+            consultationAppointmentId,
+            treatmentRecord.id,
+            visitId,
+            transaction
+          );
+        }
+
+        return {
+          ...treatmentRecord.dataValues,
+          convertedAppointmentId
+        };
+      });
+    } else {
+      throw new createError.BadRequest(
+        "Please provide correct createType value"
+      );
+    }
+  }
+
+  async getVisitInfoService() {
+    const visitIdParam = this._request.params.visitId;
+
+    const existingVisitConsultations = await visitConsultationsAssociations
+      .findAll({
+        where: { visitId: visitIdParam }
+      })
+      .catch(err => {
+        console.log("Error while getting visit consultations:", err.message);
+        throw new createError.InternalServerError(err.message);
+      });
+
+    const existingVisitTreatments = await visitTreatmentsAssociations
+      .findAll({
+        where: { visitId: visitIdParam }
+      })
+      .catch(err => {
+        console.log("Error while getting visit treatments:", err.message);
+        throw new createError.InternalServerError(err.message);
+      });
+
+    return {
+      Consultations: existingVisitConsultations.map(consultation =>
+        consultation.toJSON()
+      ),
+      Treatments: existingVisitTreatments.map(treatment => treatment.toJSON())
+    };
+  }
+
+  async createPackageService() {
+    const validatedPackageData = await createPackageSchema.validateAsync(
+      this._request.body
+    );
+
+    const isPackageExist = await VisitPackagesAssociation.findOne({
+      where: {
+        visitId: validatedPackageData.visitId
+      }
+    });
+
+    if (isPackageExist) {
+      throw new createError.Conflict(Constants.PACKAGE_ALREADY_EXIST_FOR_VISIT);
+    }
+
+    const newPackageData = await VisitPackagesAssociation.create(
+      validatedPackageData
+    ).catch(err => {
+      console.log("Error while creating new visit package", err.message);
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    });
+    return newPackageData.dataValues;
+  }
+
+  async editPackageService() {
+    assertPackageEditAllowed(this._request);
+
+    const validatedPackageData = await editPackageSchema.validateAsync(
+      this._request.body
+    );
+
+    const existingPackage = await VisitPackagesAssociation.findOne({
+      where: {
+        id: validatedPackageData.id
+      }
+    });
+
+    if (!existingPackage) {
+      throw new createError.NotFound(Constants.PACKAGE_NOT_FOUND);
+    }
+
+    const updatedPackageData = await existingPackage
+      .update(validatedPackageData)
+      .catch(err => {
+        console.log("Error while updating visit package", err.message);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    return Constants.PACKAGE_UPDATED_SUCCESSFULLY;
+  }
+
+  async getPackageService() {
+    const paramVisitId = Number(this._request.params.visitId);
+    const getVisitPackageQuery = `select * from defaultdb.visit_packages_associations vpa where vpa.visitId=:paramVisitId`;
+    const visitPackageData = await this.mysqlConnection
+      .query(getVisitPackageQuery, {
+        type: Sequelize.QueryTypes.SELECT,
+        replacements: {
+          paramVisitId: paramVisitId
+        }
+      })
+      .catch(err => {
+        console.log(
+          "Error while getting visitPackages for patient",
+          err.message
+        );
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    if (!visitPackageData || visitPackageData.length === 0) {
+      return null;
+    }
+
+    const raw = visitPackageData[0];
+    // Normalize keys to camelCase (DB may return camelCase or snake_case)
+    const camelKeys = {
+      doctor_suggested_package: "doctorSuggestedPackage",
+      marketing_package: "marketingPackage",
+      registration_amount: "registrationAmount",
+      registration_date: "registrationDate",
+      donor_booking_date: "donorBookingDate",
+      donor_booking_amount: "donorBookingAmount",
+      day1_date: "day1Date",
+      day1_amount: "day1Amount",
+      pick_up_date: "pickUpDate",
+      pick_up_amount: "pickUpAmount",
+      day5_freezing_date: "day5FreezingDate",
+      day5_freezing_amount: "day5FreezingAmount",
+      hysteroscopy_date: "hysteroscopyDate",
+      hysteroscopy_amount: "hysteroscopyAmount",
+      fet_date: "fetDate",
+      fet_amount: "fetAmount",
+      era_date: "eraDate",
+      era_amount: "eraAmount",
+      pgta_date: "pgtaDate",
+      pgta_amount: "pgtaAmount",
+      upt_positive_date: "uptPositiveDate",
+      upt_positive_amount: "uptPositiveAmount",
+      visit_id: "visitId"
+    };
+    const packageData = {};
+    for (const [key, value] of Object.entries(raw)) {
+      const camelKey = camelKeys[key] || key;
+      packageData[camelKey] = value;
+    }
+
+    // Attach paid and pending amounts for PatientTracker / reports
+    let paidAmount = 0;
+    let pendingAmount = 0;
+    try {
+      const appointmentPaymentServiceObj = new AppointmentsPaymentService(
+        this._request,
+        this._response,
+        this._next
+      );
+      const pendingDetails = await appointmentPaymentServiceObj.getPendingPaymentAmountForPackageService(
+        paramVisitId
+      );
+      if (Array.isArray(pendingDetails) && pendingDetails.length > 0) {
+        paidAmount = pendingDetails.reduce(
+          (sum, row) => sum + parseFloat(row.totalPaid || 0),
+          0
+        );
+        pendingAmount = pendingDetails.reduce(
+          (sum, row) => sum + parseFloat(row.pending_amount || 0),
+          0
+        );
+      }
+    } catch (err) {
+      console.log(
+        "Error while getting paid/pending for package (non-fatal):",
+        err.message
+      );
+    }
+    packageData.paidAmount = paidAmount;
+    packageData.pendingAmount = pendingAmount;
+
+    return packageData;
+  }
+
+  async applyDiscountForPackageService() {
+    if (![1, 7].includes(this._request.userDetails?.roleDetails?.id)) {
+      throw new createError.BadRequest(
+        Constants.UNAUTHORIZED_FOR_APPLYING_DISCOUNT
+      );
+    }
+
+    const {
+      packageId,
+      discountAmount
+    } = await applyDiscountForPackageSchema.validateAsync(this._request.body);
+    const existingPackage = await VisitPackagesAssociation.findOne({
+      where: { id: packageId }
+    });
+
+    if (!existingPackage) {
+      throw new createError.NotFound(Constants.PACKAGE_NOT_FOUND);
+    }
+
+    if (existingPackage.discount > 0) {
+      throw new createError.BadRequest(Constants.DISCOUNT_ALREADY_APPLIED);
+    }
+
+    if (discountAmount > existingPackage.marketingPackage) {
+      throw new createError.BadRequest(
+        Constants.DISCOUNT_AMOUNT_SHOULD_BE_LESS
+      );
+    }
+
+    let remainingDiscount = discountAmount;
+    const fields = [
+      "uptPositiveAmount",
+      "eraAmount",
+      "fetAmount",
+      "day5FreezingAmount",
+      "hysteroscopyAmount",
+      "pickUpAmount",
+      "day1Amount"
+    ];
+
+    const updatedAmounts = {};
+
+    for (const field of fields) {
+      if (remainingDiscount <= 0) break;
+
+      const currentValue = existingPackage[field];
+      if (currentValue > 0) {
+        if (remainingDiscount >= currentValue) {
+          remainingDiscount -= currentValue;
+          updatedAmounts[field] = 0;
+        } else {
+          updatedAmounts[field] = currentValue - remainingDiscount;
+          remainingDiscount = 0;
+        }
+      }
+    }
+
+    //if remainingDiscount>0 then given discount amount is more than all amounts so stop operation
+    if (remainingDiscount > 0) {
+      throw new createError.BadRequest(
+        Constants.DISCOUNT_AMOUNT_SHOULD_BE_LESS
+      );
+    }
+
+    await existingPackage
+      .update({
+        ...updatedAmounts,
+        discount: discountAmount
+      })
+      .catch(err => {
+        console.log("Error while applying discounts to package", err.message);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    return Constants.DISCOUNT_APPLIED_SUCCESSFULLY;
+  }
+
+  async getDonarInformationService() {
+    /* donorStatus to show buttons in UI
+      0 -> Pay Donor
+      1 -> Create Donor (no donor row, or required documents missing)
+      2 -> Start Donor Trigger (donor complete, trigger not started)
+      3 -> View Donor (donor trigger started)
+    */
+
+    const data = await this.mysqlConnection
+      .query(getDonarInformationQuery, {
+        type: Sequelize.QueryTypes.SELECT
+      })
+      .catch(err => {
+        console.log("error while getting donar information list", err);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    return data;
+  }
+
+  async getDonarDataByVisitIdService() {
+    const paramVisitId = Number(this._request.params.visitId);
+    if (!paramVisitId) {
+      throw new createError.BadRequest("visit Id is required");
+    }
+    return await VisitDonarsAssociation.findOne({
+      where: {
+        visitId: paramVisitId
+      }
+    }).catch(err => {
+      console.log("error while getting donar information by visitId", err);
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    });
+  }
+
+  resolveDonorFileS3Key(fileUrl, visitId, fileType) {
+    if (fileUrl && typeof fileUrl === "string") {
+      if (fileUrl.includes(".com/")) {
+        return fileUrl.split(".com/")[1].split("?")[0];
+      }
+      if (fileUrl.startsWith("visits/")) {
+        return fileUrl.split("?")[0];
+      }
+    }
+    return `visits/${visitId}/${fileType}`;
+  }
+
+  async uploadDonarFile(visitId, type, file, transaction) {
+    try {
+      const key = `visits/${visitId}/${type}`;
+      const uploadParams = {
+        Bucket: this.bucketName,
+        Key: key,
+        Body: file[0].buffer,
+        ContentType: file[0].mimetype
+      };
+
+      const uploadResult = await this.s3.upload(uploadParams).promise();
+      return uploadResult.Location;
+    } catch (error) {
+      console.error(`Error uploading ${type} to S3:`, error);
+      throw error;
+    }
+  }
+
+  async saveDonarService() {
+    const createdByUserId = this._request?.userDetails?.id;
+    const validatedData = await saveDonarSchema.validateAsync(
+      this._request.body
+    );
+    validatedData.createdBy = createdByUserId;
+
+    //check payment details
+
+    const donorPaymentDetails = await this.mysqlConnection
+      .query(donorPaymentCheckQuery, {
+        type: Sequelize.QueryTypes.SELECT,
+        replacements: {
+          visitId: validatedData.visitId
+        }
+      })
+      .catch(err => {
+        console.log(
+          "Error while getting donorPaymentDetails data",
+          err.message
+        );
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    if (donorPaymentDetails[0]?.donorBookingCheck === 0) {
+      throw new createError.BadRequest(Constants.DONAR_PAYMENT_NOT_DONE);
+    }
+
+    const bloodGroupExists = await BloodGroupMaster.findOne({
+      where: { id: validatedData?.bloodGroup, isActive: 1 }
+    });
+
+    if (!bloodGroupExists) {
+      throw new createError.BadRequest(
+        "Invalid or inactive blood group selected"
+      );
+    }
+
+    const existingDonar = await VisitDonarsAssociation.findOne({
+      where: {
+        visitId: validatedData.visitId
+      }
+    });
+
+    if (existingDonar) {
+      throw new createError.BadRequest(Constants.SAVE_DONAR_CONFLICT);
+    }
+
+    const requiredFiles = [
+      "kyc",
+      "marriageCertificate",
+      "birthCertificate",
+      "aadhaar",
+      "donarPhotoUrl",
+      "donarSignatureUrl",
+      "form24b",
+      "insuranceCertificate",
+      "spouseAadharCard",
+      "artBankCertificate",
+      "anaesthesiaConsent",
+      "form13"
+    ];
+
+    const missingFiles = requiredFiles.filter(
+      field => !this._request.files?.[field]
+    );
+    if (missingFiles.length > 0) {
+      throw new createError.BadRequest(
+        `Missing required files: ${missingFiles.join(", ")}`
+      );
+    }
+
+    return await this.mysqlConnection.transaction(async t => {
+      try {
+        //prepare parallel uploads
+        const uploadPromises = requiredFiles.map(field =>
+          this.uploadDonarFile(
+            validatedData.visitId,
+            field,
+            this._request.files[field],
+            t
+          ).then(url => ({ field, url }))
+        );
+
+        // Execute all uploads in parallel
+        const uploadResults = await Promise.all(uploadPromises);
+
+        uploadResults.forEach(({ field, url }) => {
+          validatedData[field] = url;
+        });
+
+        return await VisitDonarsAssociation.create(validatedData, {
+          transaction: t
+        });
+      } catch (error) {
+        console.error("Error in saveDonarService:", error);
+        throw createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      }
+    });
+  }
+
+  async editDonarService() {
+    const updatedByUserId = this._request?.userDetails?.id;
+    const validatedData = await editDonarSchema.validateAsync(
+      this._request.body
+    );
+
+    const existingDonar = await VisitDonarsAssociation.findOne({
+      where: { visitId: validatedData.visitId }
+    });
+
+    if (!existingDonar) {
+      throw new createError.NotFound(Constants.DONAR_NOT_FOUND);
+    }
+
+    const fileFields = [
+      "kyc",
+      "marriageCertificate",
+      "birthCertificate",
+      "aadhaar",
+      "donarPhotoUrl",
+      "donarSignatureUrl",
+      "form24b",
+      "insuranceCertificate",
+      "spouseAadharCard",
+      "artBankCertificate",
+      "anaesthesiaConsent",
+      "form13"
+    ];
+
+    return await this.mysqlConnection.transaction(async t => {
+      try {
+        // Prepare parallel uploads only for changed files
+        const uploadPromises = fileFields.map(async field => {
+          if (this._request.files?.[field]) {
+            return this.uploadDonarFile(
+              validatedData.visitId,
+              field,
+              this._request.files[field],
+              t
+            ).then(url => ({ field, url }));
+          }
+          //unchanged files - should keep old url as usual
+          return { field, url: existingDonar[field] };
+        });
+
+        const uploadResults = await Promise.all(uploadPromises);
+
+        uploadResults.forEach(({ field, url }) => {
+          validatedData[field] = url;
+        });
+
+        validatedData.updatedBy = updatedByUserId;
+        await existingDonar.update(validatedData, { transaction: t });
+
+        return existingDonar;
+      } catch (error) {
+        console.error("Error in editDonarService:", error);
+        throw createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      }
+    });
+  }
+
+  async deleteDonorFileService() {
+    const validatedData = await deleteDonorFileSchema.validateAsync(
+      this._request.body
+    );
+
+    const { id, visitId, fileType } = validatedData;
+
+    return await this.mysqlConnection.transaction(async t => {
+      const existingDonar = await VisitDonarsAssociation.findOne({
+        where: { id, visitId },
+        transaction: t
+      });
+
+      if (!existingDonar) {
+        throw new createError.NotFound(Constants.DONAR_NOT_FOUND);
+      }
+
+      const fileUrl = existingDonar[fileType];
+      if (!fileUrl) {
+        throw new createError.BadRequest("Document not found for this donor.");
+      }
+
+      const key = this.resolveDonorFileS3Key(fileUrl, visitId, fileType);
+      const deleteParams = {
+        Bucket: this.bucketName,
+        Key: key
+      };
+
+      try {
+        await this.s3.deleteObject(deleteParams).promise();
+        console.log(`Donor file deleted from S3: ${key}`);
+      } catch (s3Error) {
+        console.error("S3 delete warning (donor file):", s3Error.message);
+      }
+
+      await existingDonar.update({ [fileType]: null }, { transaction: t });
+
+      return existingDonar;
+    });
+  }
+
+  async saveHysteroscopyService() {
+    const validatedData = await saveHysteroscopySchema.validateAsync(
+      this._request.body
+    );
+
+    return await this.mysqlConnection.transaction(async t => {
+      const existingHysteroscopy = await VisitHysteroscopyAssociations.findOne({
+        where: {
+          visitId: validatedData.visitId,
+          patientId: validatedData.patientId
+        },
+        transaction: t
+      });
+
+      if (existingHysteroscopy) {
+        await existingHysteroscopy.update(validatedData, { transaction: t });
+        return existingHysteroscopy;
+      }
+
+      const newHysteroscopy = await VisitHysteroscopyAssociations.create(
+        {
+          ...validatedData
+        },
+        { transaction: t }
+      ).catch(error => {
+        console.error("Error in saveHysteroscopy Service:", error);
+        throw createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+      return newHysteroscopy;
+    });
+  }
+
+  async getHysteroscopyService() {
+    const { patientId, visitId } = this._request.query;
+    console.log("patientId, visitId:", patientId, visitId);
+    if (!patientId || !visitId) {
+      throw new createError.BadRequest(Constants.PATIENTID_VISITID_REQUIRED);
+    }
+
+    return await this.mysqlConnection.transaction(async t => {
+      const patient = await PatientMasterModel.findOne({
+        where: { id: patientId },
+        transaction: t
+      });
+
+      if (!patient) {
+        throw new createError.NotFound(Constants.PATIENT_NOT_FOUND);
+      }
+
+      const visit = await patientVisitsAssociation.findOne({
+        where: { id: visitId, patientId },
+        transaction: t
+      });
+
+      if (!visit) {
+        throw new createError.NotFound(Constants.VISIT_WITH_PATIENT_NOT_FOUND);
+      }
+      const hysteroscopy = await VisitHysteroscopyAssociations.findOne({
+        where: { patientId, visitId },
+        transaction: t
+      });
+
+      if (!hysteroscopy) {
+        throw new createError.NotFound(Constants.HYSTEROSCOPY_NOT_FOUND);
+      }
+
+      const referenceImages = await VisitHysteroscopyReferenceImages.findAll({
+        where: { hysteroscopyId: hysteroscopy.id },
+        transaction: t
+      });
+
+      hysteroscopy.dataValues.referenceImages = referenceImages;
+
+      return hysteroscopy;
+    });
+  }
+
+  async uploadHysteroscopyReferenceImageToS3(file, hysteroscopyId) {
+    try {
+      const uniqueFileName = `${file.originalname.split(".")[0]}_${Date.now()}`;
+      const extension = file.originalname.split(".").pop();
+      const key = `hysteroscopy/referenceImages/${hysteroscopyId}/${uniqueFileName}.${extension}`;
+
+      const uploadParams = {
+        Bucket: this.bucketName,
+        Key: key,
+        Body: file.buffer,
+        ContentType: file.mimetype
+      };
+
+      const uploadResult = await this.s3.upload(uploadParams).promise();
+
+      return {
+        imageUrl: uploadResult.Location,
+        imageKey: key
+      };
+    } catch (err) {
+      console.log("Error while uploading task image to S3: ", err);
+      throw new Error("Error while uploading image");
+    }
+  }
+
+  async addHysteroscopyReferenceImagesService() {
+    const { hysteroscopyId } = this._request.params;
+
+    if (!hysteroscopyId) {
+      throw new createError.BadRequest(Constants.PROVIDE_HYSTEROSCOPY_ID);
+    }
+
+    const hysteroscopyDetails = await VisitHysteroscopyAssociations.findByPk(
+      hysteroscopyId
+    );
+
+    if (!hysteroscopyDetails) {
+      throw new createError.NotFound(Constants.HYSTEROSCOPY_NOT_FOUND);
+    }
+
+    const uploadedBy = this._request.userDetails?.id;
+
+    if (
+      !this._request?.files ||
+      !this._request?.files?.hysteroscopyReferenceImages
+    ) {
+      throw new createError.BadRequest(Constants.PROVIDE_REFERENCE_IMAGES);
+    }
+
+    return await this.mysqlConnection.transaction(async t => {
+      const uploadedImages = [];
+
+      if (
+        this._request?.files &&
+        this._request?.files?.hysteroscopyReferenceImages
+      ) {
+        for (const file of this._request.files.hysteroscopyReferenceImages) {
+          const {
+            imageUrl,
+            imageKey
+          } = await this.uploadHysteroscopyReferenceImageToS3(
+            file,
+            hysteroscopyId
+          );
+          const createdImage = await VisitHysteroscopyReferenceImages.create(
+            {
+              hysteroscopyId,
+              imageUrl,
+              imageKey,
+              uploadedBy
+            },
+            { transaction: t }
+          ).catch(err => {
+            console.log(
+              "Error while uploading hysteroscopy reference image",
+              err.message
+            );
+            throw new createError.InternalServerError(
+              Constants.SOMETHING_ERROR_OCCURRED
+            );
+          });
+
+          uploadedImages.push({
+            id: createdImage.id,
+            imageUrl,
+            imageKey
+          });
+        }
+      }
+
+      return uploadedImages;
+    });
+  }
+
+  async deleteHysteroscopyReferenceImageService() {
+    const { imageId } = this._request.params;
+    if (!imageId) {
+      throw new createError.BadRequest("Reference Image ID is required");
+    }
+    const imageRecord = await VisitHysteroscopyReferenceImages.findByPk(
+      imageId
+    );
+    if (!imageRecord) {
+      throw new createError.NotFound("Reference Image not found");
+    }
+
+    try {
+      await this.s3
+        .deleteObject({ Bucket: this.bucketName, Key: imageRecord.imageKey })
+        .promise();
+    } catch (err) {
+      console.log("Error while deleting image from S3: ", err.message);
+    }
+
+    await VisitHysteroscopyReferenceImages.destroy({ where: { id: imageId } });
+
+    return "Reference image deleted successfully";
+  }
+}
+
+module.exports = VisitsService;

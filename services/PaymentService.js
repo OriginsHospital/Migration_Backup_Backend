@@ -1,0 +1,2537 @@
+const createError = require("http-errors");
+const MySqlConnection = require("../connections/mysql_connection");
+const StockMySqlConnection = require("../connections/stock_mysql_connection");
+const Constants = require("../constants/constants");
+const { Sequelize } = require("sequelize");
+const lodash = require("lodash");
+const { formatAmountInWords } = require("../utils/amountInWordsUtils");
+const { v4: uuidv4 } = require("uuid");
+const {
+  orderDetailsSchema,
+  transactionDetailsSchema,
+  invoiceSchema,
+  returnPharmacyItemSchema,
+  returnSchema
+} = require("../schemas/paymentSchemas");
+const OrderDetailsMasterModel = require("../models/Master/OrderDetailsMasterModel");
+const TreatmentOrdersMasterModel = require("../models/Order/treatmentOrdersMaster");
+const moment = require("moment-timezone");
+const RazorpayConnection = require("../connections/razarpay_connection");
+const treatmentAppointmentLineBillsAssociations = require("../models/Associations/treatmentAppointmentLineBillsAssociations");
+const consultationAppointmentLineBillsAssociations = require("../models/Associations/consultationAppointmentLineBillsAssociations");
+const PharmacyPurchaseDetailsTemp = require("../models/Order/pharmacyPurchaseDetailsTemp");
+const GrnItemsAssociationsModel = require("../models/Associations/grnItemsAssociations");
+const {
+  invoiceForConsultationAppointmentsQuery,
+  invoiceForTreatementAppointmentsQuery,
+  pharmacyConsultationProductTable,
+  pharmacyTreatmentProductTable,
+  patientItemReturnConsultationQuery,
+  patientItemReturnTreatementQuery,
+  getConsultationFormFPatientDetails,
+  getTreatmentFormFPatientDetails,
+  invoiceForTreatmentOrdersMileStoneQuery,
+  getAppointmentReasonForInvoiceQuery,
+  consultationOrderDetailsForInvoiceQuery,
+  treatmentOrderDetailsForInvoiceQuery,
+  checkSpouseOrPatientByAppointmentIdQuery,
+  patientHeaderForInvoiceQuery,
+  patientHeaderForInvoiceQueryTreatmentOrders,
+  patientItemReturnConsultationQueryOtherThanPharmacy,
+  patientItemReturnTreatementQueryOtherThanPharmacy,
+  patientItemReturnHistoryOtherThanPharmacy
+} = require("../queries/payment_queries");
+let { invoiceTemplate } = require("../templates/invoiceTemplate");
+let { patientHeaderForInvoice } = require("../templates/headerTemplates");
+const GrnDetailsMasterModel = require("../models/Master/grnDetailsMaster");
+const BranchMasterModel = require("../models/Master/branchMaster");
+const { getGrnItemLineForRefundQuery } = require("../queries/pharmacy_queries");
+const formFTemplate = require("../templates/formFTemplate");
+const patientScanFormFAssociationsModel = require("../models/Associations/patientScanFormFAssociation");
+const BaseService = require("../services/baseService");
+const GenerateHtmlTemplate = require("../utils/templateUtils");
+const PatientPurchaseReturnsModel = require("../models/Master/patientPurchaseReturnsModel");
+const PatientPharmacyPurchaseReturnsModel = require("../models/Master/PatientPharmacyPurchaseReturnsModel");
+class PaymentService extends BaseService {
+  constructor(request, response, next) {
+    super(request, response, next);
+    this._request = request;
+    this._response = response;
+    this._next = next;
+    this.mySqlConnection = MySqlConnection._instance;
+    this.stockMySqlConnection = StockMySqlConnection._instance;
+    this.razorpay = RazorpayConnection.getRazorpay();
+    this.htmlTemplateGenerationObj = new GenerateHtmlTemplate();
+  }
+
+  async getBranchIdByRefIdAndType(refId, type) {
+    try {
+      let branchId = null,
+        branchCode = null;
+      if (type === "Treatment") {
+        const result = await this.mySqlConnection.query(
+          `SELECT taa.branchId, bm.branchCode  FROM treatment_appointment_line_bills_associations talba
+           INNER JOIN treatment_appointments_associations taa ON taa.id = talba.appointmentId
+           INNER JOIN branch_master bm ON bm.id = taa.branchId
+           WHERE talba.id = :refId`,
+          {
+            type: Sequelize.QueryTypes.SELECT,
+            replacements: { refId }
+          }
+        );
+        if (result && result.length > 0) {
+          branchId = result[0].branchId;
+          branchCode = result[0].branchCode;
+        }
+      } else if (type === "Consultation") {
+        const result = await this.mySqlConnection.query(
+          `SELECT caa.branchId, bm.branchCode FROM consultation_appointment_line_bills_associations calba
+           INNER JOIN consultation_appointments_associations caa ON caa.id = calba.appointmentId
+           INNER JOIN branch_master bm ON bm.id = caa.branchId
+           WHERE calba.id = :refId`,
+          {
+            type: Sequelize.QueryTypes.SELECT,
+            replacements: { refId }
+          }
+        );
+        if (result && result.length > 0) {
+          branchId = result[0].branchId;
+          branchCode = result[0].branchCode;
+        }
+      }
+      return { branchId, branchCode };
+    } catch (err) {
+      console.error("Error while fetching branchId:", err);
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    }
+  }
+
+  resolveRefundBranchId(payload) {
+    const userBranches = this._request?.userDetails?.branchDetails || [];
+    const branchIds = userBranches
+      .map(branch => Number(branch.id))
+      .filter(id => !Number.isNaN(id) && id > 0);
+
+    if (payload?.refundBranchId) {
+      const refundBranchId = Number(payload.refundBranchId);
+      if (!branchIds.includes(refundBranchId)) {
+        throw new createError.Forbidden(
+          "You do not have access to the selected refund branch."
+        );
+      }
+      return refundBranchId;
+    }
+
+    if (branchIds.length === 1) {
+      return branchIds[0];
+    }
+
+    if (branchIds.length > 1) {
+      throw new createError.BadRequest(
+        "refundBranchId is required when user has access to multiple branches."
+      );
+    }
+
+    throw new createError.BadRequest("Unable to resolve refund branch.");
+  }
+
+  buildCrossBranchRefundInvoiceNumber(sourceInvoiceNumber, refundBranchCode) {
+    const sourceInvoice =
+      (sourceInvoiceNumber || "").toString().trim() ||
+      `INV${String(Date.now()).slice(-5)}`;
+    const branchCode = (refundBranchCode || "BRN")
+      .toString()
+      .trim()
+      .toUpperCase()
+      .slice(0, 3);
+    return `${sourceInvoice} - ${branchCode}`;
+  }
+
+  async findOrCreateUniqueRefundInvoiceNumber(invoiceBase, transaction) {
+    let refundInvoiceNumber = invoiceBase;
+    let invoiceSuffix = 1;
+
+    while (true) {
+      const existingInvoice = await GrnDetailsMasterModel.findOne({
+        where: { invoiceNumber: refundInvoiceNumber },
+        transaction
+      });
+      if (!existingInvoice) {
+        break;
+      }
+      refundInvoiceNumber = `${invoiceBase}-${invoiceSuffix}`;
+      invoiceSuffix += 1;
+    }
+
+    return refundInvoiceNumber;
+  }
+
+  async addCrossBranchRefundStock({
+    sourceGrnId,
+    itemId,
+    refundBranchId,
+    qty,
+    transaction
+  }) {
+    const sourceRows = await this.stockMySqlConnection
+      .query(getGrnItemLineForRefundQuery, {
+        type: Sequelize.QueryTypes.SELECT,
+        replacements: { grnId: sourceGrnId, itemId },
+        transaction
+      })
+      .catch(err => {
+        console.log("Error while fetching source GRN item for refund", err);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    if (!sourceRows?.length) {
+      throw new createError.BadRequest(
+        `Invalid source GRN ${sourceGrnId} for item ${itemId}.`
+      );
+    }
+
+    const source = sourceRows[0];
+    const refundBranch = await BranchMasterModel.findOne({
+      where: { id: refundBranchId, isActive: 1 }
+    }).catch(err => {
+      console.log("Error while fetching refund branch", err);
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    });
+
+    if (!refundBranch) {
+      throw new createError.BadRequest("Refund branch not found.");
+    }
+
+    const invoiceBase = this.buildCrossBranchRefundInvoiceNumber(
+      source.sourceInvoiceNumber,
+      refundBranch.branchCode
+    );
+
+    const existingRefundGrnRows = await this.stockMySqlConnection
+      .query(
+        `SELECT id, invoiceNumber, grnNo
+         FROM stockmanagement.grn_master
+         WHERE branchId = :refundBranchId
+           AND (invoiceNumber = :invoiceBase OR invoiceNumber LIKE :invoiceLike)
+         ORDER BY id ASC
+         LIMIT 1`,
+        {
+          type: Sequelize.QueryTypes.SELECT,
+          replacements: {
+            refundBranchId,
+            invoiceBase,
+            invoiceLike: `${invoiceBase}%`
+          },
+          transaction
+        }
+      )
+      .catch(err => {
+        console.log("Error while finding cross-branch refund GRN", err);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    let refundGrn = existingRefundGrnRows?.length
+      ? await GrnDetailsMasterModel.findOne({
+          where: { id: existingRefundGrnRows[0].id },
+          transaction
+        })
+      : null;
+
+    if (!refundGrn) {
+      const refundInvoiceNumber = await this.findOrCreateUniqueRefundInvoiceNumber(
+        invoiceBase,
+        transaction
+      );
+
+      refundGrn = await GrnDetailsMasterModel.create(
+        {
+          branchId: refundBranchId,
+          date: moment()
+            .tz("Asia/Kolkata")
+            .format("YYYY-MM-DD"),
+          supplierId: source.supplierId,
+          supplierEmail: source.supplierEmail,
+          supplierAddress: source.supplierAddress,
+          supplierGstNumber: source.supplierGstNumber,
+          invoiceNumber: refundInvoiceNumber
+        },
+        { transaction }
+      ).catch(err => {
+        console.log("Error while creating cross-branch refund GRN", err);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+      await GrnDetailsMasterModel.update(
+        { grnNo: String(refundGrn.id) },
+        { where: { id: refundGrn.id }, transaction }
+      ).catch(err => {
+        console.log("Error while updating cross-branch refund GRN number", err);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+    }
+
+    const matchingRows = await this.stockMySqlConnection
+      .query(
+        `SELECT id, totalQuantity
+         FROM stockmanagement.grn_items_associations
+         WHERE grnId = :grnId
+           AND itemId = :itemId
+           AND IFNULL(batchNo, '') = IFNULL(:batchNo, '')
+           AND expiryDate = :expiryDate
+         ORDER BY id DESC
+         LIMIT 1`,
+        {
+          type: Sequelize.QueryTypes.SELECT,
+          replacements: {
+            grnId: refundGrn.id,
+            itemId,
+            batchNo: source.batchNo || "",
+            expiryDate: source.expiryDate
+          },
+          transaction
+        }
+      )
+      .catch(err => {
+        console.log("Error while finding refund GRN stock line", err);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    if (matchingRows?.length) {
+      await this.stockMySqlConnection.query(
+        `UPDATE stockmanagement.grn_items_associations
+         SET totalQuantity = totalQuantity + :qty
+         WHERE id = :id
+         LIMIT 1`,
+        {
+          replacements: {
+            qty,
+            id: Number(matchingRows[0].id)
+          },
+          transaction
+        }
+      );
+    } else {
+      await GrnItemsAssociationsModel.create(
+        {
+          grnId: refundGrn.id,
+          itemId: source.itemId,
+          batchNo: source.batchNo,
+          expiryDate: source.expiryDate,
+          pack: source.pack,
+          quantity: source.quantity,
+          freeQuantity: source.freeQuantity,
+          intialQuantity: qty,
+          totalQuantity: qty,
+          mrp: source.mrp,
+          rate: source.rate,
+          mrpPerTablet: source.mrpPerTablet,
+          ratePerTablet: source.ratePerTablet,
+          discountPercentage: source.discountPercentage,
+          taxPercentage: source.taxPercentage,
+          discountAmount: source.discountAmount,
+          taxAmount: source.taxAmount,
+          amount: source.amount,
+          isReturned: 0
+        },
+        { transaction }
+      ).catch(err => {
+        console.log("Error while creating refund GRN stock line", err);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+    }
+
+    return {
+      sourceGrnId,
+      refundGrnId: refundGrn.id,
+      refundInvoiceNumber: refundGrn.invoiceNumber || invoiceBase
+    };
+  }
+
+  async addSameBranchRefundStock({
+    grnId,
+    itemId,
+    branchId,
+    qty,
+    transaction
+  }) {
+    const eligibleGrnQuery = `SELECT gia.id
+       FROM stockmanagement.grn_items_associations gia
+       INNER JOIN stockmanagement.grn_master gm ON gm.id = gia.grnId
+       WHERE gia.grnId = :grnId
+         AND gia.itemId = :itemId
+         AND gm.branchId = :branchId
+         {returnedFilter}
+       ORDER BY gia.id DESC
+       LIMIT 1`;
+    const grnQueryReplacements = { grnId, itemId, branchId };
+    let eligibleRows = await this.stockMySqlConnection.query(
+      eligibleGrnQuery.replace(
+        "{returnedFilter}",
+        "AND IFNULL(gia.isReturned, 0) = 0"
+      ),
+      {
+        type: Sequelize.QueryTypes.SELECT,
+        replacements: grnQueryReplacements,
+        transaction
+      }
+    );
+    if (!eligibleRows?.length) {
+      eligibleRows = await this.stockMySqlConnection.query(
+        eligibleGrnQuery.replace("{returnedFilter}", ""),
+        {
+          type: Sequelize.QueryTypes.SELECT,
+          replacements: grnQueryReplacements,
+          transaction
+        }
+      );
+    }
+
+    if (!eligibleRows?.length) {
+      throw new createError.BadRequest(
+        `Invalid GRN ${grnId} for item ${itemId} at branch ${branchId}.`
+      );
+    }
+
+    await this.stockMySqlConnection.query(
+      `UPDATE stockmanagement.grn_items_associations
+       SET totalQuantity = totalQuantity + :qty
+       WHERE id = :grnItemAssociationId
+       LIMIT 1`,
+      {
+        replacements: {
+          qty,
+          grnItemAssociationId: Number(eligibleRows[0].id)
+        },
+        transaction
+      }
+    );
+  }
+
+  async getOrderIdHandlerservice() {
+    try {
+      const validOrderData = await orderDetailsSchema.validateAsync(
+        this._request.body
+      );
+      const {
+        totalOrderAmount,
+        paidOrderAmount,
+        discountAmount,
+        orderDetails,
+        couponCode,
+        paymentMode,
+        productType
+      } = validOrderData;
+
+      let orderId;
+
+      const normalizeCurrency = amount =>
+        Number((Number(amount) || 0).toFixed(2));
+
+      const totalPayableAmount = normalizeCurrency(
+        totalOrderAmount - discountAmount
+      );
+      const normalizedPaidOrderAmount = normalizeCurrency(paidOrderAmount);
+
+      // Compare in 2-decimal currency precision to avoid floating-point mismatches.
+      if (totalPayableAmount !== normalizedPaidOrderAmount) {
+        throw new createError.BadRequest(Constants.PAYABLE_AMOUNT_WRONG);
+      }
+      if (paymentMode === "ONLINE") {
+        let refId = orderDetails[0].refId;
+        let type = orderDetails[0].type;
+        console.log("productType:", productType);
+        console.log("refId:", refId);
+        console.log("type:", type);
+        if (!productType || !refId || !type) {
+          throw new createError.BadRequest(
+            "Product type, refId or type is missing in order details"
+          );
+        }
+
+        const { branchId, branchCode } = await this.getBranchIdByRefIdAndType(
+          refId,
+          type
+        );
+        if (!branchId) {
+          throw new createError.NotFound(Constants.BRANCH_NOT_FOUND);
+        }
+        console.log("Branch ID:", branchId);
+        console.log("Branch Code:", branchCode);
+        let accountId = null;
+        if (branchId === 2) {
+          if (productType === "PHARMACY") {
+            // HNK Pharmacy
+            accountId = "acc_QvFVMPGxSRDCc8";
+          } else {
+            // HNK Frontdesk
+            accountId = "acc_QvFxqAwkJA1KCX";
+          }
+        } else if (branchId === 1 || branchId === 3 || branchId === 4) {
+          accountId = "acc_QjXMw2peC4keGS";
+        } else {
+          throw new createError.NotFound(Constants.BRANCH_NOT_FOUND);
+        }
+        console.log("Account ID:", accountId);
+        if (!accountId) {
+          throw new createError.NotFound(Constants.ACCOUNT_NOT_FOUND);
+        }
+        try {
+          const razorpayOrder = await this.razorpay.orders.create({
+            amount: paidOrderAmount * 100,
+            currency: "INR",
+            receipt: uuidv4(),
+            payment_capture: 1,
+            notes: { branch: branchCode },
+            transfers: [
+              {
+                account: accountId,
+                amount: paidOrderAmount * 100,
+                currency: "INR",
+                notes: { purpose: "Order routed to sub-account" }
+              }
+            ]
+          });
+          orderId = razorpayOrder.id;
+        } catch (err) {
+          console.log("Razorpay order creation failed:", err?.error || err);
+          throw new createError.InternalServerError(
+            "Failed to create Razorpay order"
+          );
+        }
+      } else {
+        orderId = moment.tz("Asia/Kolkata").format("YYYYMMDDHHmmssSS");
+      }
+
+      const orderData = {
+        orderId,
+        totalOrderAmount,
+        paidOrderAmount,
+        discountAmount,
+        couponCode,
+        orderDetails: JSON.stringify(orderDetails),
+        orderDate: moment()
+          .tz("Asia/Kolkata")
+          .format("YYYY-MM-DD HH:mm:ss"),
+        paymentMode,
+        productType,
+        paymentStatus:
+          paymentMode === "CASH" || paymentMode === "UPI" ? "PAID" : "DUE"
+      };
+
+      const orderDetailsResponse = await OrderDetailsMasterModel.create(
+        orderData
+      );
+
+      if (productType == "CONSULTATION FEE") {
+        // Handle consultation free seperately
+        return this.consultationFeeOrderIdService(
+          orderData,
+          orderDetailsResponse
+        );
+      }
+
+      if (paymentMode != "ONLINE") {
+        const getExistingOrderDetails = JSON.parse(
+          orderDetailsResponse.dataValues.orderDetails
+        );
+
+        await this.mySqlConnection.transaction(async t => {
+          // Fetching the appointment Id and Type
+          let appointmentId = null;
+          if (getExistingOrderDetails[0].type == "Treatment") {
+            let appointmentData = await treatmentAppointmentLineBillsAssociations
+              .findOne({
+                where: {
+                  id: getExistingOrderDetails[0].refId
+                }
+              })
+              .catch(err => {
+                console.log("Error while fetching appointment Details", err);
+                throw new createError.InternalServerError(
+                  Constants.SOMETHING_ERROR_OCCURRED
+                );
+              });
+
+            if (!lodash.isEmpty(appointmentData)) {
+              appointmentId = appointmentData.appointmentId;
+            }
+          } else if (getExistingOrderDetails[0].type == "Consultation") {
+            let appointmentData = await consultationAppointmentLineBillsAssociations
+              .findOne({
+                where: {
+                  id: getExistingOrderDetails[0].refId
+                }
+              })
+              .catch(err => {
+                console.log("Error while fetching appointment Details", err);
+                throw new createError.InternalServerError(
+                  Constants.SOMETHING_ERROR_OCCURRED
+                );
+              });
+
+            if (!lodash.isEmpty(appointmentData)) {
+              appointmentId = appointmentData.appointmentId;
+            }
+          }
+
+          const orderDataUpdated = {
+            ...orderDetailsResponse.dataValues,
+            paymentStatus: "PAID",
+            appointmentId,
+            type: getExistingOrderDetails[0].type
+          };
+
+          await OrderDetailsMasterModel.update(orderDataUpdated, {
+            where: { orderId },
+            transaction: t
+          });
+
+          if (getExistingOrderDetails.length > 0) {
+            // Use Promise.all to wait for all async operations to complete
+            await Promise.all(
+              getExistingOrderDetails.map(async item => {
+                const refId = item.refId;
+                const type = item.type;
+
+                if (type === "Treatment") {
+                  await treatmentAppointmentLineBillsAssociations.update(
+                    { status: "PAID" },
+                    { where: { id: refId }, transaction: t }
+                  );
+                } else {
+                  await consultationAppointmentLineBillsAssociations.update(
+                    { status: "PAID" },
+                    { where: { id: refId }, transaction: t }
+                  );
+                }
+
+                // If type is PHARMACY then return the unpurchased stock
+                if (orderDetailsResponse.productType == "PHARMACY") {
+                  let itemId = null;
+                  if (type == "Treatment") {
+                    let itemInfo = await treatmentAppointmentLineBillsAssociations.findOne(
+                      {
+                        where: { id: refId },
+                        transaction: t
+                      }
+                    );
+                    if (!lodash.isEmpty(itemInfo)) {
+                      itemId = itemInfo.billTypeValue;
+                    }
+                  } else {
+                    let itemInfo = await consultationAppointmentLineBillsAssociations.findOne(
+                      {
+                        where: { id: refId },
+                        transaction: t
+                      }
+                    );
+                    if (!lodash.isEmpty(itemInfo)) {
+                      itemId = itemInfo.billTypeValue;
+                    }
+                  }
+                  // Perform stock operations in a separate transaction
+                  await this.stockMySqlConnection.transaction(
+                    async stockTransaction => {
+                      await this.returnStockToGrn(
+                        item,
+                        itemId,
+                        stockTransaction
+                      );
+                    }
+                  );
+                }
+              })
+            );
+
+            // If Scans then handle form F Templates
+            await this.generateFormFTemplatesForScans(
+              getExistingOrderDetails,
+              productType,
+              getExistingOrderDetails[0].type,
+              appointmentId,
+              t
+            );
+          }
+        });
+      }
+
+      return orderDetailsResponse;
+    } catch (err) {
+      console.error("Error while adding order details:", err.message);
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    }
+  }
+
+  async returnStockToGrn(item, itemId, transaction) {
+    const purchaseDetailsTempData = await PharmacyPurchaseDetailsTemp.findOne({
+      where: {
+        refId: item.refId,
+        type: item.type
+      },
+      transaction: transaction // Use the passed transaction
+    });
+
+    if (!lodash.isEmpty(purchaseDetailsTempData)) {
+      let purchaseDetails = JSON.parse(purchaseDetailsTempData.purchaseDetails);
+
+      // Use Promise.all to handle async
+      await Promise.all(
+        purchaseDetails.map(async details => {
+          let grnId = details.grnId;
+          let returnQuantity = details?.returnedQuantity || 0;
+          try {
+            await GrnItemsAssociationsModel.update(
+              {
+                totalQuantity: Sequelize.literal(
+                  `totalQuantity + ${returnQuantity}`
+                )
+              },
+              {
+                where: {
+                  grnId: grnId,
+                  itemId: itemId
+                },
+                transaction: transaction
+              }
+            );
+          } catch (err) {
+            console.log("Error while updating GrnItemsAssociations", err);
+            throw new createError.InternalServerError(
+              Constants.SOMETHING_ERROR_OCCURRED
+            );
+          }
+        })
+      );
+
+      // Keep temp purchase details after payment so downstream history
+      // (doctor/patient pharmacy history) can display nonPurchaseReason.
+      // These rows are overwritten on subsequent pack/save for same refId.
+    }
+  }
+
+  async generateFormFTemplatesForScans(
+    existedOrderDetails,
+    productType,
+    type,
+    appointmentId,
+    transaction
+  ) {
+    if (productType == "SCAN") {
+      let query = "";
+      if (type == "Treatment") {
+        query = getTreatmentFormFPatientDetails;
+      } else if (type == "Consultation") {
+        query = getConsultationFormFPatientDetails;
+      }
+
+      let refIds = existedOrderDetails.map(each => {
+        return each.refId;
+      });
+
+      let data = await this.mySqlConnection
+        .query(query, {
+          type: Sequelize.QueryTypes.SELECT,
+          replacements: {
+            refIds: refIds
+          },
+          transaction: transaction
+        })
+        .catch(err => {
+          console.log("Error while generating the form F template", err);
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+
+      if (!lodash.isEmpty(data) && data.length > 0) {
+        data = data[0].detailsForFormF;
+        let formFTemplates = [];
+        data.forEach(row => {
+          if (row?.isFormFRequired == 1) {
+            let currentFormFTemplate = formFTemplate;
+            currentFormFTemplate = currentFormFTemplate
+              .replaceAll("{patientName}", row?.patientName?.toUpperCase())
+              .replaceAll("{patientAge}", row?.patientAge)
+              .replaceAll("{guardianName}", row?.guardianName || "")
+              .replaceAll("{completeaddress}", row?.completeAddress)
+              .replaceAll("{doctorName}", row?.doctorName)
+              .replaceAll("{scanName}", row?.scanName)
+              .replaceAll("{hospitalAddress}", row?.hospitalAddress)
+              .replaceAll("{registrationNumber}", row?.resgistrationNumber);
+            formFTemplates.push({
+              appointmentId: appointmentId,
+              type: type,
+              formFTemplate: currentFormFTemplate,
+              isReviewed: 0,
+              scanId: row?.scanId
+            });
+          }
+        });
+
+        await patientScanFormFAssociationsModel
+          .bulkCreate(formFTemplates, {
+            transaction: transaction
+          })
+          .catch(err => {
+            console.log("Error while inserting form f templates", err);
+            throw new createError.InternalServerError(
+              Constants.SOMETHING_ERROR_OCCURRED
+            );
+          });
+      }
+    }
+  }
+
+  async sendTransactionIdservice() {
+    try {
+      const validTransactionData = await transactionDetailsSchema.validateAsync(
+        this._request.body
+      );
+      const { orderId, transactionId, transactionType } = validTransactionData;
+
+      // Check if it is consultation fee online payment or not
+      const existedOrderDetails = await OrderDetailsMasterModel.findOne({
+        where: { orderId }
+      });
+
+      if (!existedOrderDetails) {
+        throw new createError.NotFound(Constants.ORDER_DETAILS_DOES_NOT_EXIST);
+      }
+
+      if (existedOrderDetails.dataValues.productType == "CONSULTATION FEE") {
+        return this.consultationFeeTransactionIdService(
+          orderId,
+          existedOrderDetails,
+          transactionId
+        );
+      }
+
+      // If not consultation fee, proceed with next steps
+      await this.mySqlConnection.transaction(async t => {
+        const getExistingOrderDetails = JSON.parse(
+          existedOrderDetails.dataValues.orderDetails
+        );
+
+        // Fetching the appointment Id and Type
+        let appointmentId = null;
+        if (getExistingOrderDetails[0].type == "Treatment") {
+          let appointmentData = await treatmentAppointmentLineBillsAssociations
+            .findOne({
+              where: {
+                id: getExistingOrderDetails[0].refId
+              }
+            })
+            .catch(err => {
+              console.log("Error while fetching appointment Details", err);
+              throw new createError.InternalServerError(
+                Constants.SOMETHING_ERROR_OCCURRED
+              );
+            });
+
+          if (!lodash.isEmpty(appointmentData)) {
+            appointmentId = appointmentData.appointmentId;
+          }
+        } else if (getExistingOrderDetails[0].type == "Consultation") {
+          let appointmentData = await consultationAppointmentLineBillsAssociations
+            .findOne({
+              where: {
+                id: getExistingOrderDetails[0].refId
+              }
+            })
+            .catch(err => {
+              console.log("Error while fetching appointment Details", err);
+              throw new createError.InternalServerError(
+                Constants.SOMETHING_ERROR_OCCURRED
+              );
+            });
+
+          if (!lodash.isEmpty(appointmentData)) {
+            appointmentId = appointmentData.appointmentId;
+          }
+        }
+
+        const orderDataUpdated = {
+          ...existedOrderDetails.dataValues,
+          transactionId,
+          transactionType,
+          paymentStatus: "PAID",
+          appointmentId,
+          type: getExistingOrderDetails[0].type
+        };
+
+        await OrderDetailsMasterModel.update(orderDataUpdated, {
+          where: { orderId },
+          transaction: t
+        });
+
+        if (getExistingOrderDetails.length > 0) {
+          // Use Promise.all to wait for all async operations to complete
+          await Promise.all(
+            getExistingOrderDetails.map(async item => {
+              const refId = item.refId;
+              const type = item.type;
+
+              if (type === "Treatment") {
+                await treatmentAppointmentLineBillsAssociations.update(
+                  { status: "PAID" },
+                  { where: { id: refId }, transaction: t }
+                );
+              } else {
+                await consultationAppointmentLineBillsAssociations.update(
+                  { status: "PAID" },
+                  { where: { id: refId }, transaction: t }
+                );
+              }
+
+              // If type is PHARMACY then return the unpurchased stock
+              if (existedOrderDetails.productType == "PHARMACY") {
+                let itemId = null;
+                if (type == "Treatment") {
+                  let itemInfo = await treatmentAppointmentLineBillsAssociations.findOne(
+                    {
+                      where: { id: refId },
+                      transaction: t
+                    }
+                  );
+                  if (!lodash.isEmpty(itemInfo)) {
+                    itemId = itemInfo.billTypeValue;
+                  }
+                } else {
+                  let itemInfo = await consultationAppointmentLineBillsAssociations.findOne(
+                    {
+                      where: { id: refId },
+                      transaction: t
+                    }
+                  );
+                  if (!lodash.isEmpty(itemInfo)) {
+                    itemId = itemInfo.billTypeValue;
+                  }
+                }
+                // Perform stock operations in a separate transaction
+                await this.stockMySqlConnection.transaction(
+                  async stockTransaction => {
+                    await this.returnStockToGrn(item, itemId, stockTransaction);
+                  }
+                );
+              }
+            })
+          );
+
+          // If Scans then handle form F Templates
+          await this.generateFormFTemplatesForScans(
+            getExistingOrderDetails,
+            existedOrderDetails.productType,
+            getExistingOrderDetails[0].type,
+            appointmentId,
+            t
+          );
+        }
+      });
+
+      return Constants.PAYMENT_SUCCESSFUL;
+    } catch (err) {
+      console.error("Error while processing transaction:", err);
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    }
+  }
+
+  formatPrescriptionDetails = details => {
+    if (details.startsWith("OTHER_")) {
+      return details.split("_")[1];
+    }
+    return details;
+  };
+
+  async generatePatientHeaderInformationForInvoice(
+    appointmentId,
+    type,
+    id,
+    isSpouse,
+    orderDetails
+  ) {
+    let data = null;
+    if (appointmentId == null) {
+      // It is treatment based order, so information using visitId
+      data = await this.mysqlConnection
+        .query(patientHeaderForInvoiceQueryTreatmentOrders, {
+          type: Sequelize.QueryTypes.SELECT,
+          replacements: {
+            id: id,
+            isSpouse: isSpouse
+          }
+        })
+        .catch(err => {
+          console.log(
+            "Error while fetching patient information for header",
+            err
+          );
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+    } else {
+      data = await this.mysqlConnection
+        .query(patientHeaderForInvoiceQuery, {
+          type: Sequelize.QueryTypes.SELECT,
+          replacements: {
+            appointmentId: appointmentId,
+            type: type,
+            isSpouse: isSpouse
+          }
+        })
+        .catch(err => {
+          console.log(
+            "Error while fetching patient information for header",
+            err
+          );
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+    }
+
+    const splitSummary = orderDetails?.splitPaymentSummary;
+    const splitCashAmount = orderDetails?.splitCashAmount;
+    const splitUpiAmount = orderDetails?.splitUpiAmount;
+    let paymentModeLabel = orderDetails?.paymentMode || "";
+
+    if (splitSummary) {
+      paymentModeLabel = `${orderDetails?.paymentMode} (Split)`;
+      if (splitCashAmount || splitUpiAmount) {
+        paymentModeLabel += ` | Cash: ${splitCashAmount ||
+          0}, UPI: ${splitUpiAmount || 0}`;
+      } else {
+        paymentModeLabel += ` | ${splitSummary}`;
+      }
+    }
+
+    let patientHeaderInforForInvoice = patientHeaderForInvoice;
+    patientHeaderInforForInvoice = patientHeaderInforForInvoice
+      .replaceAll("{{orderNo}}", orderDetails?.orderNo)
+      .replaceAll("{{orderDate}}", orderDetails?.orderDate)
+      .replaceAll("{{patientId}}", data[0]?.patientInformation?.patientId)
+      .replaceAll("{{name}}", data[0]?.patientInformation?.name)
+      .replaceAll("{{doctorName}}", data[0]?.patientInformation?.doctorName)
+      .replaceAll("{{ageGender}}", data[0]?.patientInformation?.ageGender)
+      .replaceAll("{{mobileNumber}}", data[0]?.patientInformation?.mobileNumber)
+      .replaceAll("{{paymentMode}}", paymentModeLabel);
+
+    return patientHeaderInforForInvoice;
+  }
+
+  /*
+    Spouse Flag Conditions
+
+    1.Scans, labs, embryology, pharmacy -> LineBills Based
+    2.Consultation Fee -> appointment reason based
+    3.Treatement milestone with package -> always patient 
+    4.Treatement without package -> appointment reason based
+
+    Point 1 & 2 Covered In getOrderDetailsForInvoiceWithSpouseFlag
+    Point 3 & 4 Covered in generateProductInformationTableForTreatmentOrders
+  */
+  async getOrderDetailsForInvoiceWithSpouseFlag(
+    orderDetails,
+    type,
+    productType,
+    appointmentId
+  ) {
+    if (productType == "CONSULTATION FEE") {
+      let data = await this.mySqlConnection
+        .query(checkSpouseOrPatientByAppointmentIdQuery, {
+          type: Sequelize.QueryTypes.SELECT,
+          replacements: {
+            type: type,
+            appointmentId: appointmentId
+          }
+        })
+        .catch(err => {
+          console.log("Error while fetching isSpouse Or patient", err);
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+      if (!lodash.isEmpty(orderDetails) && orderDetails.length > 0) {
+        return [
+          {
+            ...orderDetails[0],
+            prescribedTo:
+              !lodash.isEmpty(data) && data[0].isSpouse == 0
+                ? "PATIENT"
+                : "SPOUSE"
+          }
+        ];
+      }
+      return [];
+    } else {
+      let refIds = orderDetails.map(each => {
+        return each.refId;
+      });
+
+      let query = null;
+      if (type == "Consultation") {
+        query = consultationOrderDetailsForInvoiceQuery;
+      } else if (type == "Treatment") {
+        query = treatmentOrderDetailsForInvoiceQuery;
+      }
+      let itemInfo = await this.mySqlConnection.query(query, {
+        type: Sequelize.QueryTypes.SELECT,
+        replacements: {
+          refId: refIds.map(id => String(id)),
+          productType: productType
+        }
+      });
+      if (!lodash.isEmpty(itemInfo) && itemInfo[0]?.itemDetails) {
+        return itemInfo[0].itemDetails;
+      }
+    }
+    return [];
+  }
+
+  formatBatchNumbersFromPurchaseDetails(purchaseDetails) {
+    if (!Array.isArray(purchaseDetails) || purchaseDetails.length === 0) {
+      return "-";
+    }
+    const batchNos = purchaseDetails
+      .map(pd => pd?.batchNo)
+      .filter(batchNo => batchNo != null && String(batchNo).trim() !== "");
+    const uniqueBatchNos = [...new Set(batchNos)];
+    return uniqueBatchNos.length > 0 ? uniqueBatchNos.join(", ") : "-";
+  }
+
+  async resolveBatchNumbersForInvoice(purchaseDetails) {
+    const fromStored = this.formatBatchNumbersFromPurchaseDetails(
+      purchaseDetails
+    );
+    if (fromStored !== "-") {
+      return fromStored;
+    }
+    if (!Array.isArray(purchaseDetails) || purchaseDetails.length === 0) {
+      return "-";
+    }
+    const grnIds = [
+      ...new Set(
+        purchaseDetails
+          .map(pd => Number(pd?.grnId))
+          .filter(grnId => Number.isFinite(grnId) && grnId > 0)
+      )
+    ];
+    if (grnIds.length === 0) {
+      return "-";
+    }
+    const rows = await this.stockMySqlConnection
+      .query(
+        `SELECT DISTINCT gia.batchNo
+         FROM stockmanagement.grn_items_associations gia
+         WHERE gia.grnId IN (:grnIds)
+           AND gia.batchNo IS NOT NULL
+           AND TRIM(gia.batchNo) <> ''`,
+        {
+          replacements: { grnIds },
+          type: Sequelize.QueryTypes.SELECT
+        }
+      )
+      .catch(err => {
+        console.log("Error while resolving batch numbers for invoice", err);
+        return [];
+      });
+    const batchNos = rows
+      .map(row => row?.batchNo)
+      .filter(batchNo => batchNo != null && String(batchNo).trim() !== "");
+    const uniqueBatchNos = [...new Set(batchNos)];
+    return uniqueBatchNos.length > 0 ? uniqueBatchNos.join(", ") : "-";
+  }
+
+  async generateProductInformationTable(
+    appointmentId,
+    type,
+    productType,
+    orderId
+  ) {
+    const purchaseDetails = await OrderDetailsMasterModel.findOne({
+      where: {
+        appointmentId: appointmentId,
+        type: type,
+        productType: productType,
+        orderId: orderId
+      }
+    }).catch(err => {
+      console.log("Error whole getting the details", err);
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    });
+    if (productType == "PHARMACY") {
+      // PHARMACY HANDLED DIFFERENYLY AS ITEM COST IS BASED ON THE GRN , IT IS AVAILABLE IN ORDER DETAILS
+      // WE NEED PRESCIBED AND PURCHASE QUANTITY IN PHARMACY
+      let orderDetails = JSON.parse(purchaseDetails?.orderDetails);
+      let refIds = orderDetails.map(each => {
+        return each.refId;
+      });
+
+      let query = null;
+      if (type == "Consultation") {
+        query = pharmacyConsultationProductTable;
+      } else if (type == "Treatment") {
+        query = pharmacyTreatmentProductTable;
+      }
+
+      let itemInfo = await this.mySqlConnection.query(query, {
+        type: Sequelize.QueryTypes.SELECT,
+        replacements: {
+          refId: refIds.map(id => String(id))
+        }
+      });
+
+      if (!lodash.isEmpty(itemInfo)) {
+        itemInfo = itemInfo[0];
+        const orderData = await Promise.all(
+          (itemInfo?.itemInfo || []).map(async (info, index) => {
+            const costInfo = orderDetails.find(
+              details => details.refId == info.refId
+            );
+            return {
+              serialNumber: index + 1,
+              itemName: info.itemName,
+              batchNo: await this.resolveBatchNumbersForInvoice(
+                costInfo?.purchaseDetails
+              ),
+              presQty: info.prescribedQuantity,
+              purcQty: info.purchaseQuantity,
+              totalCost: costInfo ? `Rs. ${costInfo.totalCost}` : "N/A",
+              prescribedTo: info?.prescribedTo
+            };
+          })
+        );
+        return orderData;
+      }
+    } else if (
+      ["LAB TEST", "SCAN", "EMBRYOLOGY", "CONSULTATION FEE"].includes(
+        productType
+      )
+    ) {
+      let orderDetails = JSON.parse(purchaseDetails?.orderDetails);
+      orderDetails = await this.getOrderDetailsForInvoiceWithSpouseFlag(
+        orderDetails,
+        type,
+        productType,
+        appointmentId
+      );
+      return (orderDetails || []).map((item, index) => ({
+        serialNumber: index + 1,
+        ...item
+      }));
+    }
+    return []; // IF NONE MATCHED
+  }
+
+  async generateProductInformationTableForTreatmentOrders(
+    type,
+    productType,
+    orderId
+  ) {
+    const purchaseDetails = await TreatmentOrdersMasterModel.findOne({
+      where: {
+        type: type,
+        productType: productType,
+        orderId: orderId
+      }
+    }).catch(err => {
+      console.log("Error whole getting the details", err);
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    });
+    if (productType.indexOf("APPOINTMENT") === -1) {
+      // MILESTONE PAYMENT
+      return [
+        {
+          serialNumber: 1,
+          itemName: productType,
+          totalCost: purchaseDetails?.paidOrderAmountBeforeDiscount,
+          prescribedTo: "PATIENT" // Always Patient for Milestone Package Based
+        }
+      ];
+    } else {
+      // APPOINTMENT BASED MILESTONE
+      let data = await this.mySqlConnection
+        .query(getAppointmentReasonForInvoiceQuery, {
+          replacements: {
+            orderId: orderId
+          },
+          type: Sequelize.QueryTypes.SELECT
+        })
+        .catch(err => {
+          console.log(
+            "Error while fetching the appointmnet reason for treatement",
+            err
+          );
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+
+      if (!lodash.isEmpty(data)) {
+        return [
+          {
+            serialNumber: 1,
+            itemName: data[0]?.appointmentReason,
+            totalCost: purchaseDetails?.paidOrderAmountBeforeDiscount,
+            prescribedTo: data[0]?.isSpouse == 0 ? "PATIENT" : "SPOUSE"
+          }
+        ];
+      }
+    }
+  }
+
+  async generateInvoiceService() {
+    const {
+      appointmentId,
+      type,
+      productType,
+      id
+    } = await invoiceSchema.validateAsync(this._request.body);
+
+    let orderDetails = null;
+    let isTreatmentOrder = false;
+    // For Invoice Sepearate Function to generate A5 Size Header
+    const hospitalLogoHeaderTemplate = await this.hospitalLogoHeaderTemplateForInvoice(
+      appointmentId,
+      type,
+      id
+    );
+
+    if (appointmentId) {
+      // For Normal orders other than Treatment Milestones
+      orderDetails = await OrderDetailsMasterModel.findOne({
+        where: {
+          appointmentId: appointmentId,
+          type: type,
+          productType: productType
+        }
+      }).catch(err => {
+        console.log("Error while fetching order details", err);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+    } else {
+      isTreatmentOrder = true;
+      orderDetails = await TreatmentOrdersMasterModel.findOne({
+        where: {
+          id: id,
+          type: type,
+          productType: productType
+        }
+      }).catch(err => {
+        console.log("Error while fetching order details", err);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+    }
+
+    if (lodash.isEmpty(orderDetails)) {
+      throw new createError.BadRequest(Constants.PAYMENT_DETAILS_NOT_FOUND);
+    }
+
+    let invoiceDetailsQuery = null;
+    if (type == "Consultation") {
+      if (appointmentId) {
+        invoiceDetailsQuery =
+          invoiceForConsultationAppointmentsQuery +
+          (id ? ` AND odm.id = :id` : "");
+      }
+    } else if (type == "Treatment") {
+      if (appointmentId) {
+        invoiceDetailsQuery =
+          invoiceForTreatementAppointmentsQuery +
+          (id ? ` AND odm.id = :id` : "");
+      } else {
+        invoiceDetailsQuery = invoiceForTreatmentOrdersMileStoneQuery;
+      }
+    }
+
+    let invoiceTemplates = [];
+    let invoiceDetailsList = await this.mySqlConnection
+      .query(invoiceDetailsQuery, {
+        type: Sequelize.QueryTypes.SELECT,
+        replacements: {
+          appointmentId: appointmentId,
+          productType: productType,
+          id: id
+        }
+      })
+      .catch(err => {
+        console.log("Error while getting invoice details data", err.message);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    for (const invoiceDetails of invoiceDetailsList) {
+      const { paidAmount } = { ...invoiceDetails?.paymentBreakUp }; // Converstion into words
+      let patientOrderAndPaymentInfo = {
+        ...invoiceDetails?.orderDetails,
+        ...invoiceDetails?.paymentBreakUp,
+        amountInWords: formatAmountInWords(paidAmount),
+        currentDate: invoiceDetails?.currentDate,
+        hospitalLogoInformation: hospitalLogoHeaderTemplate,
+        Currency: "Rs",
+        isPharmacy: productType == "PHARMACY" ? 1 : 0,
+        isScan: productType == "SCAN" ? 1 : 0,
+        isLab: productType == "LAB TEST" ? 1 : 0,
+        isEmbryology: productType == "EMBRYOLOGY" ? 1 : 0,
+        isConsultationFee: productType == "CONSULTATION FEE" ? 1 : 0,
+        isAppointment: productType.indexOf("APPOINTMENT") !== -1 ? 1 : 0, //  APPOINTMENT_45 Etc.
+        isMileStone:
+          !appointmentId && productType.indexOf("APPOINTMENT") === -1 ? 1 : 0 // Treatment Order and not of type APPOINTMENT_45 etc.
+      };
+
+      let productTableData;
+      if (!isTreatmentOrder) {
+        //  For all orders except treatment milestones
+        productTableData = await this.generateProductInformationTable(
+          appointmentId,
+          type,
+          productType,
+          invoiceDetails?.orderDetails?.orderNo
+        );
+      } else {
+        productTableData = await this.generateProductInformationTableForTreatmentOrders(
+          type,
+          productType,
+          invoiceDetails?.orderDetails?.orderNo
+        );
+      }
+
+      const spouseProducts = productTableData.filter(
+        item => item.prescribedTo === "SPOUSE"
+      );
+      const nonSpouseProducts = productTableData.filter(
+        item => item.prescribedTo === "PATIENT"
+      );
+
+      if (nonSpouseProducts.length > 0) {
+        const patientHeaderForInvoice = await this.generatePatientHeaderInformationForInvoice(
+          appointmentId,
+          type,
+          id,
+          0,
+          invoiceDetails?.orderDetails
+        );
+
+        const nonSpouseInfo = {
+          ...patientOrderAndPaymentInfo,
+          productTable: nonSpouseProducts,
+          patientHeaderInformation: patientHeaderForInvoice
+        };
+
+        const htmlContent = await this.htmlTemplateGenerationObj.generateTemplateFromText(
+          invoiceTemplate,
+          nonSpouseInfo
+        );
+
+        invoiceTemplates.push(htmlContent);
+      }
+
+      if (spouseProducts.length > 0) {
+        const patientHeaderForInvoice = await this.generatePatientHeaderInformationForInvoice(
+          appointmentId,
+          type,
+          id,
+          1,
+          invoiceDetails?.orderDetails
+        );
+
+        const spouseInfo = {
+          ...patientOrderAndPaymentInfo,
+          productTable: spouseProducts,
+          patientHeaderInformation: patientHeaderForInvoice
+        };
+
+        const htmlContent = await this.htmlTemplateGenerationObj.generateTemplateFromText(
+          invoiceTemplate,
+          spouseInfo
+        );
+
+        invoiceTemplates.push(htmlContent);
+      }
+    }
+    let finalTemplate = invoiceTemplates.join("");
+    if (!finalTemplate.trim()) {
+      throw new createError.BadRequest(Constants.PAYMENT_DETAILS_NOT_FOUND);
+    }
+    return `
+      <html>
+        <head>
+          <title>Origins Invoice</title>
+        </head>
+        <body style="margin: 0; padding: 0;">
+          <div style="display: flex;flex-direction: column; justify-content: center; align-items: center;">  
+            ${finalTemplate}
+          </div>
+        </body>
+      </html>
+    `;
+  }
+
+  async getSaleReturnInformationService() {
+    const { orderId } = this._request.params;
+
+    if (!orderId) {
+      throw new createError.BadRequest(
+        Constants.PARAMS_ERROR.replaceAll("{params}", "Order Id")
+      );
+    }
+
+    const orderDetails = await OrderDetailsMasterModel.findOne({
+      where: {
+        orderId: orderId,
+        productType: "PHARMACY",
+        paymentStatus: "PAID"
+      }
+    }).catch(err => {
+      console.log("error while fetching order details", err);
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    });
+
+    let orderInformation = null;
+
+    if (lodash.isEmpty(orderDetails)) {
+      throw new createError.BadRequest(Constants.ORDER_DETAILS_DOES_NOT_EXIST);
+    }
+
+    if (orderDetails?.type == "Consultation") {
+      orderInformation = await this.mySqlConnection
+        .query(patientItemReturnConsultationQuery, {
+          type: Sequelize.QueryTypes.SELECT,
+          replacements: {
+            orderId: orderId
+          }
+        })
+        .catch(err => {
+          console.log(
+            "Error while fetching order information of pharmacy consultation",
+            err
+          );
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+    } else if (orderDetails?.type == "Treatment") {
+      orderInformation = await this.mySqlConnection
+        .query(patientItemReturnTreatementQuery, {
+          type: Sequelize.QueryTypes.SELECT,
+          replacements: {
+            orderId: orderId
+          }
+        })
+        .catch(err => {
+          console.log(
+            "Error while fetching order information of pharmacy treatment",
+            err
+          );
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+    }
+
+    if (!lodash.isEmpty(orderInformation) && orderInformation.length > 0) {
+      orderInformation = orderInformation[0];
+    }
+
+    if (orderInformation) {
+      orderInformation.type = orderDetails?.type || null;
+      if (orderInformation.patientDetails) {
+        orderInformation.patientDetails = {
+          ...orderInformation.patientDetails,
+          purchaseType: orderDetails?.type || null
+        };
+      }
+
+      // Always expose order payment summary from the master row for refund discount math.
+      let orderSummary = orderInformation.orderSummary;
+      if (typeof orderSummary === "string") {
+        try {
+          orderSummary = JSON.parse(orderSummary);
+        } catch (err) {
+          orderSummary = {};
+        }
+      }
+      if (!orderSummary || typeof orderSummary !== "object") {
+        orderSummary = {};
+      }
+      orderInformation.orderSummary = {
+        totalOrderAmount: Number(
+          orderSummary.totalOrderAmount ?? orderDetails?.totalOrderAmount ?? 0
+        ),
+        paidOrderAmount: Number(
+          orderSummary.paidOrderAmount ?? orderDetails?.paidOrderAmount ?? 0
+        ),
+        discountAmount: Number(
+          orderSummary.discountAmount ?? orderDetails?.discountAmount ?? 0
+        ),
+        couponCode: orderSummary.couponCode ?? orderDetails?.couponCode ?? null
+      };
+    }
+
+    // If purchasedItems is null or empty, try to parse orderDetails directly as fallback
+    if (
+      orderInformation &&
+      (!orderInformation.purchasedItems ||
+        (Array.isArray(orderInformation.purchasedItems) &&
+          orderInformation.purchasedItems.length === 0))
+    ) {
+      console.log(
+        "purchasedItems is empty, attempting to parse orderDetails directly"
+      );
+
+      try {
+        // Parse orderDetails JSON if it exists
+        if (orderDetails && orderDetails.orderDetails) {
+          const parsedOrderDetails =
+            typeof orderDetails.orderDetails === "string"
+              ? JSON.parse(orderDetails.orderDetails)
+              : orderDetails.orderDetails;
+
+          if (
+            Array.isArray(parsedOrderDetails) &&
+            parsedOrderDetails.length > 0
+          ) {
+            console.log("Found orderDetails, creating fallback purchasedItems");
+
+            // Create purchasedItems from orderDetails
+            const fallbackPurchasedItems = parsedOrderDetails.map(item => ({
+              refId: item.refId,
+              itemId: item.id || item.itemId || item.refId,
+              itemName: item.itemName || "N/A",
+              purchaseQuantity: item.prescribed || item.purchaseQuantity || 0,
+              returnQuantity: 0, // No returns yet
+              totalCost: item.totalCost || 0,
+              purchaseDetails: item.purchaseDetails || [] // May be empty but structure is correct
+            }));
+
+            // Add to orderInformation
+            if (!orderInformation.purchasedItems) {
+              orderInformation.purchasedItems = fallbackPurchasedItems;
+            } else {
+              orderInformation.purchasedItems = fallbackPurchasedItems;
+            }
+
+            console.log(
+              "Created fallback purchasedItems:",
+              fallbackPurchasedItems
+            );
+          }
+        }
+      } catch (parseError) {
+        console.error("Error parsing orderDetails as fallback:", parseError);
+      }
+    }
+
+    if (orderInformation?.purchasedItems && orderDetails?.orderDetails) {
+      const { byRefId } = this.buildOrderDetailsMap(orderDetails.orderDetails);
+      let purchasedItems = orderInformation.purchasedItems;
+      if (typeof purchasedItems === "string") {
+        try {
+          purchasedItems = JSON.parse(purchasedItems);
+        } catch (err) {
+          purchasedItems = [];
+        }
+      }
+      if (Array.isArray(purchasedItems)) {
+        orderInformation.purchasedItems = purchasedItems.map(item => {
+          const refId = Number(item?.refId);
+          const raw = byRefId.get(refId);
+          const hasPurchaseDetails =
+            Array.isArray(item?.purchaseDetails) &&
+            item.purchaseDetails.length > 0;
+          const rawPurchaseDetails = Array.isArray(raw?.purchaseDetails)
+            ? raw.purchaseDetails
+            : [];
+          if (!hasPurchaseDetails && rawPurchaseDetails.length > 0) {
+            return {
+              ...item,
+              purchaseDetails: rawPurchaseDetails
+            };
+          }
+          return item;
+        });
+      }
+    }
+
+    let itemReturnHistory = await this.stockMySqlConnection
+      .query(
+        `SELECT id, orderId, returnDetails, returnedDate, totalAmount
+         FROM stockmanagement.patient_pharamacy_purchase_returns
+         WHERE orderId = :orderId
+         ORDER BY id DESC`,
+        {
+          replacements: { orderId },
+          type: Sequelize.QueryTypes.SELECT
+        }
+      )
+      .catch(err => {
+        console.log("error while fetching pharmacy return history", err);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+    itemReturnHistory = Array.isArray(itemReturnHistory)
+      ? itemReturnHistory.map(row => this.normalizePharmacyReturnRecord(row))
+      : [];
+
+    return {
+      orderInformation,
+      itemReturnHistory
+    };
+  }
+
+  buildOrderDetailsMap(orderDetails) {
+    const parsed =
+      typeof orderDetails === "string"
+        ? JSON.parse(orderDetails)
+        : orderDetails;
+    if (!Array.isArray(parsed)) {
+      return { parsedOrderDetails: [], byRefId: new Map() };
+    }
+    const byRefId = new Map(parsed.map(item => [Number(item.refId), item]));
+    return { parsedOrderDetails: parsed, byRefId };
+  }
+
+  getOrderDiscountMultiplier(orderRow) {
+    const totalOrderAmount = Number(orderRow?.totalOrderAmount || 0);
+    const paidOrderAmount = Number(orderRow?.paidOrderAmount || 0);
+    const discountAmount = Number(orderRow?.discountAmount || 0);
+    if (totalOrderAmount <= 0) {
+      return 1;
+    }
+    if (paidOrderAmount > 0 && paidOrderAmount <= totalOrderAmount) {
+      return paidOrderAmount / totalOrderAmount;
+    }
+    if (discountAmount > 0 && discountAmount < totalOrderAmount) {
+      return (totalOrderAmount - discountAmount) / totalOrderAmount;
+    }
+    return 1;
+  }
+
+  getUndiscountedLineTotalFromPurchaseDetails(purchaseDetails) {
+    if (!Array.isArray(purchaseDetails)) {
+      return 0;
+    }
+    return purchaseDetails.reduce((sum, pd) => {
+      const qty = Number(pd?.initialUsedQuantity ?? pd?.usedQuantity ?? 0);
+      return sum + Number(pd?.mrpPerTablet || 0) * qty;
+    }, 0);
+  }
+
+  /** Allocates order-level coupon/discount across line items by stored line totals. */
+  getPharmacyLinePaidRatio(orderRow, parsedOrderDetails) {
+    const totalOrderAmount = Number(orderRow?.totalOrderAmount || 0);
+    const paidOrderAmount = Number(orderRow?.paidOrderAmount || 0);
+    const sumLineTotals = (parsedOrderDetails || []).reduce(
+      (sum, item) => sum + Number(item?.totalCost || 0),
+      0
+    );
+
+    // Line items already store the post-discount paid amount (e.g. medicine stages).
+    if (
+      sumLineTotals > 0 &&
+      paidOrderAmount >= 0 &&
+      Math.abs(sumLineTotals - paidOrderAmount) < 0.05
+    ) {
+      return 1;
+    }
+
+    // Order header discount/coupon is authoritative when lines hold pre-discount MRP.
+    if (totalOrderAmount > 0) {
+      return this.getOrderDiscountMultiplier(orderRow);
+    }
+
+    if (sumLineTotals > 0 && paidOrderAmount >= 0) {
+      return paidOrderAmount / sumLineTotals;
+    }
+
+    return this.getOrderDiscountMultiplier(orderRow);
+  }
+
+  getPharmacyLineTotalBasis(orderEntry) {
+    const storedLineTotal = Number(orderEntry?.totalCost);
+    const hasStoredLineTotal =
+      orderEntry?.totalCost !== undefined &&
+      orderEntry?.totalCost !== null &&
+      !Number.isNaN(storedLineTotal);
+
+    if (hasStoredLineTotal) {
+      return storedLineTotal;
+    }
+
+    const purchaseDetails = Array.isArray(orderEntry?.purchaseDetails)
+      ? orderEntry.purchaseDetails
+      : [];
+    return this.getUndiscountedLineTotalFromPurchaseDetails(purchaseDetails);
+  }
+
+  getPharmacyLinePaidEffective(orderEntry, linePaidRatio) {
+    const lineTotalBasis = this.getPharmacyLineTotalBasis(orderEntry);
+    // Explicit zero line total means a 100% item coupon — nothing was paid for this line.
+    if (lineTotalBasis === 0) {
+      return 0;
+    }
+    return lineTotalBasis * Number(linePaidRatio || 1);
+  }
+
+  getPharmacyRefundGrnUnitPrice({
+    orderEntry,
+    lineBill,
+    purchaseInfo,
+    linePaidRatio
+  }) {
+    const paidLineEffective = this.getPharmacyLinePaidEffective(
+      orderEntry,
+      linePaidRatio
+    );
+    const purchasedQty = Number(lineBill?.purchaseQuantity || 0);
+
+    if (paidLineEffective <= 0) {
+      return 0;
+    }
+    // Order/coupon discount is on the bill total; refund the line's paid share per tablet.
+    if (purchasedQty > 0) {
+      return paidLineEffective / purchasedQty;
+    }
+    return Number(purchaseInfo?.mrpPerTablet || 0);
+  }
+
+  normalizePharmacyReturnRecord(row) {
+    let parsedReturnDetails = null;
+    try {
+      parsedReturnDetails =
+        typeof row.returnDetails === "string"
+          ? JSON.parse(row.returnDetails)
+          : row.returnDetails;
+    } catch (err) {
+      parsedReturnDetails = row.returnDetails;
+    }
+
+    const isNewFormat =
+      parsedReturnDetails &&
+      typeof parsedReturnDetails === "object" &&
+      !Array.isArray(parsedReturnDetails);
+    const returnItems = isNewFormat
+      ? Array.isArray(parsedReturnDetails.items)
+        ? parsedReturnDetails.items
+        : []
+      : Array.isArray(parsedReturnDetails)
+      ? parsedReturnDetails
+      : [];
+
+    return {
+      returnId: row.id,
+      orderId: row.orderId,
+      returnedDate: row.returnedDate,
+      totalAmount: Number(row.totalAmount || 0),
+      refundMethod: isNewFormat
+        ? parsedReturnDetails.refundMethod || "N/A"
+        : "N/A",
+      returnedBy: isNewFormat
+        ? parsedReturnDetails.returnedByName || "N/A"
+        : "N/A",
+      refundBranchId: isNewFormat
+        ? parsedReturnDetails.refundBranchId || null
+        : null,
+      crossBranchStockUpdates: isNewFormat
+        ? parsedReturnDetails.crossBranchStockUpdates || []
+        : [],
+      returnDetails: returnItems
+    };
+  }
+
+  async getPharmacyRefundLogsService() {
+    const orderId = this._request?.query?.orderId;
+    let whereClause = "";
+    const replacements = {};
+    if (orderId && String(orderId).trim()) {
+      whereClause = " WHERE orderId = :orderId ";
+      replacements.orderId = String(orderId).trim();
+    }
+
+    const refundRows = await this.stockMySqlConnection
+      .query(
+        `SELECT id, orderId, returnDetails, returnedDate, totalAmount
+         FROM stockmanagement.patient_pharamacy_purchase_returns
+         ${whereClause}
+         ORDER BY id DESC`,
+        {
+          replacements,
+          type: Sequelize.QueryTypes.SELECT
+        }
+      )
+      .catch(err => {
+        console.log("error while fetching pharmacy refund logs", err);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    return Array.isArray(refundRows)
+      ? refundRows.map(row => this.normalizePharmacyReturnRecord(row))
+      : [];
+  }
+
+  async returnPharmacyItemService() {
+    const payload = await returnPharmacyItemSchema.validateAsync(
+      this._request.body
+    );
+    const { orderId, patientId, returnDetails, totalAmount, type } = payload;
+    const refundMethod = payload?.refundMethod || "CASH";
+    const returnedByName = this._request?.userDetails?.fullName || "N/A";
+
+    const orderDetails = await OrderDetailsMasterModel.findOne({
+      where: {
+        orderId: orderId,
+        productType: "PHARMACY",
+        paymentStatus: "PAID",
+        type: type
+      }
+    }).catch(err => {
+      console.log("error while fetching pharmacy order details", err);
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    });
+
+    if (lodash.isEmpty(orderDetails)) {
+      throw new createError.BadRequest(Constants.ORDER_DETAILS_DOES_NOT_EXIST);
+    }
+
+    const { parsedOrderDetails, byRefId } = this.buildOrderDetailsMap(
+      orderDetails.orderDetails
+    );
+    const refIds = returnDetails.map(item => Number(item.refId));
+    const lineBillModel =
+      type === "Treatment"
+        ? treatmentAppointmentLineBillsAssociations
+        : consultationAppointmentLineBillsAssociations;
+    const lineBillRows = await lineBillModel.findAll({
+      where: { id: refIds },
+      attributes: ["id", "billTypeValue", "purchaseQuantity", "returnQuantity"]
+    });
+    const lineBillByRefId = new Map(
+      lineBillRows.map(row => [Number(row.id), row.dataValues || row])
+    );
+    const linePaidRatio = this.getPharmacyLinePaidRatio(
+      orderDetails,
+      parsedOrderDetails
+    );
+
+    let computedTotalAmount = 0;
+    const branchByRefId = new Map();
+    for (const detail of returnDetails) {
+      const refId = Number(detail.refId);
+      const itemId = Number(detail.itemId);
+      const lineBill = lineBillByRefId.get(refId);
+      if (!lineBill) {
+        throw new createError.BadRequest(`Invalid refId ${refId}.`);
+      }
+      if (Number(lineBill.billTypeValue) !== itemId) {
+        throw new createError.BadRequest(
+          `Item mismatch for refId ${refId}. Please refresh and try again.`
+        );
+      }
+
+      const orderEntry = byRefId.get(refId);
+      const purchaseDetails = Array.isArray(orderEntry?.purchaseDetails)
+        ? orderEntry.purchaseDetails
+        : [];
+      const purchaseByGrnId = new Map(
+        purchaseDetails.map(pd => [Number(pd.grnId), pd])
+      );
+
+      let normalizedReturnInfo = Array.isArray(detail.returnInfo)
+        ? detail.returnInfo
+            .map(row => ({
+              grnId: Number(row.grnId),
+              returnQuantity: Number(row.returnQuantity || 0)
+            }))
+            .filter(row => row.grnId && row.returnQuantity > 0)
+        : [];
+
+      const requestedQtyFromInfo = normalizedReturnInfo.reduce(
+        (sum, row) => sum + Number(row.returnQuantity || 0),
+        0
+      );
+      const requestedQty = Number(
+        detail.returnQuantity || requestedQtyFromInfo || 0
+      );
+      const alreadyReturned = Number(lineBill.returnQuantity || 0);
+      const purchasedQty = Number(lineBill.purchaseQuantity || 0);
+      if (requestedQty <= 0) {
+        throw new createError.BadRequest(
+          `Return quantity should be greater than 0 for refId ${refId}.`
+        );
+      }
+      if (alreadyReturned + requestedQty > purchasedQty) {
+        throw new createError.BadRequest(
+          `Return quantity exceeds purchased quantity for refId ${refId}.`
+        );
+      }
+
+      const { branchId } = await this.getBranchIdByRefIdAndType(refId, type);
+      if (!branchId) {
+        throw new createError.BadRequest(
+          `Unable to resolve branch for refund refId ${refId}.`
+        );
+      }
+      branchByRefId.set(refId, Number(branchId));
+
+      // If frontend could not map GRNs, derive the split server-side from sold details.
+      if (normalizedReturnInfo.length === 0) {
+        let remainingQty = requestedQty;
+        for (const pd of purchaseDetails) {
+          if (remainingQty <= 0) break;
+          const grnId = Number(pd.grnId);
+          const usedQty = Number(
+            pd.initialUsedQuantity ?? pd.usedQuantity ?? 0
+          );
+          // For older orders, returnedQuantity in stored purchaseDetails can be stale.
+          // Keep line-bill level checks as source of truth and allocate from sold GRNs.
+          const availableQty = Math.max(0, usedQty);
+          const qtyForThisGrn = Math.min(remainingQty, availableQty);
+          if (grnId && qtyForThisGrn > 0) {
+            normalizedReturnInfo.push({
+              grnId,
+              returnQuantity: qtyForThisGrn
+            });
+            remainingQty -= qtyForThisGrn;
+          }
+        }
+
+        // Order may retain GRN ids while usedQuantity is zeroed in stored JSON.
+        if (remainingQty > 0 && normalizedReturnInfo.length === 0) {
+          const maxReturnable = Math.max(0, purchasedQty - alreadyReturned);
+          let assignQty = Math.min(remainingQty, maxReturnable);
+          for (const pd of purchaseDetails) {
+            if (assignQty <= 0) break;
+            const grnId = Number(pd.grnId);
+            if (!grnId) continue;
+            normalizedReturnInfo.push({
+              grnId,
+              returnQuantity: assignQty
+            });
+            assignQty = 0;
+          }
+          remainingQty =
+            requestedQty -
+            normalizedReturnInfo.reduce(
+              (sum, row) => sum + Number(row.returnQuantity || 0),
+              0
+            );
+        }
+
+        // Legacy fallback: if orderDetails does not retain purchase split,
+        // map to any active GRN line for this item in the same branch.
+        if (remainingQty > 0 && normalizedReturnInfo.length === 0) {
+          const branchId = branchByRefId.get(refId);
+          if (branchId) {
+            const fallbackGrnQuery = `SELECT gia.grnId
+               FROM stockmanagement.grn_items_associations gia
+               INNER JOIN stockmanagement.grn_master gm ON gm.id = gia.grnId
+               WHERE gm.branchId = :branchId
+                 AND gia.itemId = :itemId
+                 {returnedFilter}
+               ORDER BY gia.expiryDate ASC, gia.id ASC
+               LIMIT 1`;
+            const replacements = {
+              branchId: Number(branchId),
+              itemId: Number(itemId)
+            };
+            let fallbackGrnRows = await this.stockMySqlConnection.query(
+              fallbackGrnQuery.replace(
+                "{returnedFilter}",
+                "AND IFNULL(gia.isReturned, 0) = 0"
+              ),
+              {
+                type: Sequelize.QueryTypes.SELECT,
+                replacements
+              }
+            );
+            if (!fallbackGrnRows?.length) {
+              fallbackGrnRows = await this.stockMySqlConnection.query(
+                fallbackGrnQuery.replace("{returnedFilter}", ""),
+                {
+                  type: Sequelize.QueryTypes.SELECT,
+                  replacements
+                }
+              );
+            }
+            if (fallbackGrnRows?.length > 0) {
+              normalizedReturnInfo.push({
+                grnId: Number(fallbackGrnRows[0].grnId),
+                returnQuantity: remainingQty
+              });
+              remainingQty = 0;
+            }
+          }
+        }
+
+        // If some quantity remains due rounding/legacy detail mismatch, assign it
+        // to first derived GRN so the refund can proceed with line-bill safeguards.
+        if (remainingQty > 0 && normalizedReturnInfo.length > 0) {
+          normalizedReturnInfo[0].returnQuantity =
+            Number(normalizedReturnInfo[0].returnQuantity) + remainingQty;
+          remainingQty = 0;
+        }
+
+        if (remainingQty > 0) {
+          throw new createError.BadRequest(
+            `Insufficient sold quantity available for return at refId ${refId}.`
+          );
+        }
+        detail.returnInfo = normalizedReturnInfo;
+      }
+
+      let lineCost = 0;
+      for (const row of normalizedReturnInfo) {
+        const grnId = Number(row.grnId);
+        const returnQty = Number(row.returnQuantity || 0);
+        const purchaseInfo = purchaseByGrnId.get(grnId);
+        const unitPrice = this.getPharmacyRefundGrnUnitPrice({
+          orderEntry,
+          lineBill,
+          purchaseInfo,
+          linePaidRatio
+        });
+        lineCost += unitPrice * returnQty;
+      }
+      computedTotalAmount += lineCost;
+    }
+
+    const roundedInputAmount = Number(Number(totalAmount).toFixed(2));
+    const roundedComputedAmount = Number(computedTotalAmount.toFixed(2));
+    // Client total is indicative; server-computed refund must match what was paid.
+    if (
+      roundedInputAmount > 0 &&
+      Math.abs(roundedInputAmount - roundedComputedAmount) > 0.05
+    ) {
+      throw new createError.BadRequest(Constants.PAYABLE_AMOUNT_WRONG);
+    }
+
+    const refundBranchId = this.resolveRefundBranchId(payload);
+    const crossBranchStockUpdates = [];
+
+    await this.stockMySqlConnection.transaction(async stockTransaction => {
+      for (const detail of returnDetails) {
+        const refId = Number(detail.refId);
+        const itemId = Number(detail.itemId);
+        const purchaseBranchId = branchByRefId.get(refId);
+        if (!purchaseBranchId) {
+          throw new createError.BadRequest(
+            `Unable to resolve branch for refund refId ${refId}.`
+          );
+        }
+
+        const isCrossBranchRefund =
+          Number(refundBranchId) !== Number(purchaseBranchId);
+
+        for (const row of detail.returnInfo) {
+          const qty = Number(row.returnQuantity);
+          const grnId = Number(row.grnId);
+
+          if (isCrossBranchRefund) {
+            const stockUpdate = await this.addCrossBranchRefundStock({
+              sourceGrnId: grnId,
+              itemId,
+              refundBranchId,
+              qty,
+              transaction: stockTransaction
+            });
+            crossBranchStockUpdates.push({
+              refId,
+              itemId,
+              purchaseBranchId,
+              refundBranchId,
+              ...stockUpdate,
+              returnQuantity: qty
+            });
+          } else {
+            await this.addSameBranchRefundStock({
+              grnId,
+              itemId,
+              branchId: purchaseBranchId,
+              qty,
+              transaction: stockTransaction
+            });
+          }
+        }
+      }
+    });
+
+    let refundResponse = null;
+    await this.mySqlConnection.transaction(async defaultDbTransaction => {
+      for (const detail of returnDetails) {
+        const refId = Number(detail.refId);
+        const requestedQty = detail.returnInfo.reduce(
+          (sum, row) => sum + Number(row.returnQuantity || 0),
+          0
+        );
+        await lineBillModel.update(
+          {
+            returnQuantity: Sequelize.literal(
+              `IFNULL(returnQuantity, 0) + ${requestedQty}`
+            )
+          },
+          {
+            where: { id: refId },
+            transaction: defaultDbTransaction
+          }
+        );
+
+        const orderEntry = byRefId.get(refId);
+        if (orderEntry && Array.isArray(orderEntry.purchaseDetails)) {
+          const returnByGrn = new Map(
+            detail.returnInfo.map(item => [
+              Number(item.grnId),
+              Number(item.returnQuantity)
+            ])
+          );
+          orderEntry.purchaseDetails = orderEntry.purchaseDetails.map(pd => {
+            const delta = returnByGrn.get(Number(pd.grnId)) || 0;
+            return {
+              ...pd,
+              returnedQuantity: Number(pd.returnedQuantity || 0) + delta
+            };
+          });
+        }
+      }
+
+      await OrderDetailsMasterModel.update(
+        {
+          orderDetails: JSON.stringify(parsedOrderDetails)
+        },
+        {
+          where: { id: orderDetails.id },
+          transaction: defaultDbTransaction
+        }
+      );
+
+      const returnsInsertPayload = {
+        patientId,
+        orderId,
+        returnedDate: moment()
+          .tz("Asia/Kolkata")
+          .format("YYYY-MM-DD HH:mm:ss"),
+        returnDetails: JSON.stringify({
+          items: returnDetails,
+          refundMethod,
+          returnedByName,
+          refundBranchId,
+          crossBranchStockUpdates
+        }),
+        totalAmount: roundedComputedAmount
+      };
+
+      const createdReturn = await PatientPharmacyPurchaseReturnsModel.create(
+        returnsInsertPayload
+      );
+      refundResponse = {
+        message: Constants.DATA_UPDATED_SUCCESS,
+        returnId: createdReturn?.id || null,
+        orderId,
+        refundMethod,
+        refundBranchId,
+        returnedBy: returnedByName,
+        totalAmount: roundedComputedAmount,
+        crossBranchStockUpdates,
+        returnDetails
+      };
+    });
+
+    return refundResponse || Constants.DATA_UPDATED_SUCCESS;
+  }
+
+  async consultationFeeOrderIdService(orderData, orderDetailsResponse) {
+    const { paymentMode, orderId } = orderData;
+
+    const { appointmentId, type } = JSON.parse(orderData.orderDetails)[0];
+
+    if (paymentMode != "ONLINE") {
+      await OrderDetailsMasterModel.update(
+        {
+          paymentStatus: "PAID",
+          appointmentId,
+          type: type
+        },
+        {
+          where: {
+            orderId: orderId
+          }
+        }
+      ).catch(err => {
+        console.log(
+          "Error while updating the status of order consultation",
+          err
+        );
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+    }
+
+    return orderDetailsResponse;
+  }
+
+  async consultationFeeTransactionIdService(
+    orderId,
+    existedOrderDetails,
+    transactionId
+  ) {
+    const { appointmentId, type } = JSON.parse(
+      existedOrderDetails.dataValues.orderDetails
+    )[0];
+
+    await OrderDetailsMasterModel.update(
+      {
+        paymentStatus: "PAID",
+        appointmentId,
+        transactionId: transactionId,
+        type: type
+      },
+      {
+        where: {
+          orderId: orderId
+        }
+      }
+    ).catch(err => {
+      console.log("Error while updating the status of order consultation", err);
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    });
+
+    return Constants.PAYMENT_SUCCESSFUL;
+  }
+
+  async getSaleReturnInformationServiceLabScanAndEmbryology() {
+    const { orderId } = this._request.params;
+
+    if (!orderId) {
+      throw new createError.BadRequest(
+        Constants.PARAMS_ERROR.replaceAll("{params}", "Order Id")
+      );
+    }
+
+    const orderDetails = await OrderDetailsMasterModel.findOne({
+      where: {
+        orderId: orderId,
+        paymentStatus: "PAID"
+      }
+    }).catch(err => {
+      console.log("error while fetching order details", err);
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    });
+
+    let orderInformation = null;
+
+    if (lodash.isEmpty(orderDetails)) {
+      throw new createError.BadRequest(Constants.ORDER_DETAILS_DOES_NOT_EXIST);
+    }
+
+    if (orderDetails?.type == "Consultation") {
+      orderInformation = await this.mySqlConnection
+        .query(patientItemReturnConsultationQueryOtherThanPharmacy, {
+          type: Sequelize.QueryTypes.SELECT,
+          replacements: {
+            orderId: orderId
+          }
+        })
+        .catch(err => {
+          console.log(
+            "Error while fetching order information of lab/scan/embryology consultation",
+            err
+          );
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+    } else if (orderDetails?.type == "Treatment") {
+      orderInformation = await this.mySqlConnection
+        .query(patientItemReturnTreatementQueryOtherThanPharmacy, {
+          type: Sequelize.QueryTypes.SELECT,
+          replacements: {
+            orderId: orderId
+          }
+        })
+        .catch(err => {
+          console.log(
+            "Error while fetching order information of lab/scan/embryology treatment",
+            err
+          );
+          throw new createError.InternalServerError(
+            Constants.SOMETHING_ERROR_OCCURRED
+          );
+        });
+    }
+
+    let itemReturnHistory = await this.mySqlConnection
+      .query(patientItemReturnHistoryOtherThanPharmacy, {
+        type: Sequelize.QueryTypes.SELECT,
+        replacements: {
+          orderId: orderId
+        }
+      })
+      .catch(err => {
+        console.log(
+          "Error while fetching order return history of lab/scan/embryology treatment",
+          err
+        );
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+    return {
+      orderInformation,
+      itemReturnHistory: !lodash.isEmpty(itemReturnHistory)
+        ? itemReturnHistory[0]?.return_history
+        : []
+    };
+  }
+
+  async returnItemServiceOtherThanPharmacy() {
+    let returnInformation = await returnSchema.validateAsync(
+      this._request.body
+    );
+    const orderDetails = await OrderDetailsMasterModel.findOne({
+      where: {
+        orderId: returnInformation.orderId,
+        paymentStatus: "PAID"
+      }
+    }).catch(err => {
+      console.log("error while fetching order details", err);
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    });
+
+    if (lodash.isEmpty(orderDetails)) {
+      throw new createError.BadRequest(Constants.ORDER_DETAILS_DOES_NOT_EXIST);
+    }
+
+    const { patientId, orderId, totalAmount, type } = returnInformation;
+
+    const defaultDbTransaction = await this.mySqlConnection.transaction();
+
+    try {
+      await Promise.all(
+        // For Return Quantity in Consultation and Treatment Line Bills
+        returnInformation?.returnDetails?.map(async eachRow => {
+          const { refId } = eachRow;
+          if (type == "Consultation") {
+            await consultationAppointmentLineBillsAssociations
+              .update(
+                {
+                  returnQuantity: 1
+                },
+                {
+                  where: {
+                    id: refId
+                  },
+                  transaction: defaultDbTransaction
+                }
+              )
+              .catch(err => {
+                console.log(
+                  "Error while updating return quantity in consultation",
+                  err
+                );
+                throw new createError.InternalServerError(
+                  Constants.SOMETHING_ERROR_OCCURRED
+                );
+              });
+          } else if (type == "Treatment") {
+            await treatmentAppointmentLineBillsAssociations
+              .update(
+                {
+                  returnQuantity: 1
+                },
+                {
+                  where: {
+                    id: refId
+                  },
+                  transaction: defaultDbTransaction
+                }
+              )
+              .catch(err => {
+                console.log(
+                  "Error while updating return quantity in treatment",
+                  err
+                );
+                throw new createError.InternalServerError(
+                  Constants.SOMETHING_ERROR_OCCURRED
+                );
+              });
+          }
+        })
+      );
+
+      await PatientPurchaseReturnsModel.create(
+        {
+          patientId,
+          orderId,
+          returnedDate: moment()
+            .tz("Asia/Kolkata")
+            .format("YYYY-MM-DD HH:mm:ss"),
+          type: type,
+          returnDetails: JSON.stringify(returnInformation?.returnDetails),
+          totalAmount
+        },
+        {
+          trasaction: defaultDbTransaction
+        }
+      ).catch(err => {
+        console.log("Error while inserting new row in returns table", err);
+        throw new createError.InternalServerError(
+          Constants.SOMETHING_ERROR_OCCURRED
+        );
+      });
+
+      await defaultDbTransaction.commit();
+    } catch (err) {
+      await defaultDbTransaction.rollback();
+      throw new createError.InternalServerError(
+        Constants.SOMETHING_ERROR_OCCURRED
+      );
+    }
+
+    return Constants.DATA_UPDATED_SUCCESS;
+  }
+}
+
+module.exports = PaymentService;

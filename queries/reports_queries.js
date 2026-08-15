@@ -1,0 +1,1517 @@
+const appointmentStageDurationReportQuery = `
+WITH stageReportData as (
+	SELECT * FROM (
+		SELECT
+		    JSON_OBJECT(
+		        'patientId', pm.patientId ,
+		        'patientName', CONCAT(IFNULL(pm.firstName, ''), ' ', IFNULL(pm.lastName, '')),
+		        'doctorName', (SELECT cdm.name FROM consultation_doctor_master cdm WHERE cdm.userId = caa.consultationDoctorId),
+		        'appointmentReason', COALESCE((SELECT arm.name from appointment_reason_master arm  where arm.id = caa.appointmentReasonId),'NA')
+		    ) AS appointmentDetails,
+		    'Consultation' AS type,
+		    caa.appointmentDate,
+            caa.id as appointmentId,
+		    pm.branchId,
+		    CASE 
+		        WHEN caa.noShow = 1 THEN 'No Show'
+		        WHEN LOWER(caa.stage) = 'done' THEN 'Completed'
+		        ELSE caa.stage
+		    END AS currentStage,
+		    CASE WHEN caa.noShow = 1 THEN 'No Show' ELSE IFNULL(DATE_FORMAT(caa.scanAt , '%d-%m-%Y %h:%i %p'), 'Pending') END AS scanAt,
+		    CASE 
+		        WHEN caa.noShow = 1 THEN 'No Show' 
+		        WHEN caa.isDoctor = 1 THEN CEIL(TIMESTAMPDIFF(SECOND, caa.scanAt, caa.doctorAt) / 60)
+		        ELSE 'NA'
+		    END AS scanStageDuration,
+		    CASE WHEN caa.noShow = 1 THEN 'No Show' ELSE IFNULL(DATE_FORMAT(caa.doctorAt , '%d-%m-%Y %h:%i %p'), 'Pending') END AS doctorAt,
+		    CASE 
+		        WHEN caa.noShow = 1 THEN 'No Show' 
+		        WHEN caa.isSeen = 1 THEN CEIL(TIMESTAMPDIFF(SECOND, caa.doctorAt, caa.seenAt) / 60)
+		        ELSE 'NA'
+		    END AS doctorStageDuration,
+		    CASE WHEN caa.noShow = 1 THEN 'No Show' ELSE IFNULL(DATE_FORMAT(caa.seenAt , '%d-%m-%Y %h:%i %p'), 'Pending') END AS seenAt,
+		    CASE 
+		        WHEN caa.noShow = 1 THEN 'No Show'
+		        WHEN caa.isDone = 1 THEN CEIL(TIMESTAMPDIFF(SECOND, caa.seenAt, caa.doneAt) / 60)
+		        ELSE 'NA'
+		    END AS seenStageDuration,
+		    CASE WHEN caa.noShow = 1 THEN 'No Show' ELSE IFNULL(DATE_FORMAT(caa.doneAt , '%d-%m-%Y %h:%i %p'), 'Pending') END AS doneAt
+		FROM 
+		    consultation_appointments_associations caa
+		INNER JOIN visit_consultations_associations vca ON vca.id = caa.consultationId
+		INNER JOIN patient_visits_association pva ON pva.id = vca.visitId
+		INNER JOIN patient_master pm on pm.id = pva.patientId 
+		
+		UNION ALL 
+		
+		SELECT
+		    JSON_OBJECT(
+		        'patientId', pm.patientId ,
+		        'patientName', CONCAT(IFNULL(pm.firstName, ''), ' ', IFNULL(pm.lastName, '')),
+		        'doctorName', (SELECT cdm.name FROM consultation_doctor_master cdm WHERE cdm.userId = taa.consultationDoctorId),
+		        'appointmentReason', COALESCE((SELECT arm.name from appointment_reason_master arm  where arm.id = taa.appointmentReasonId),'NA')
+		    ) AS appointmentDetails,
+		    'Treatment' AS type, 
+		    taa.appointmentDate,
+            taa.id as appointmentId,
+		    pm.branchId,
+		    CASE 
+		        WHEN taa.noShow = 1 THEN 'No Show'
+		        WHEN LOWER(taa.stage) = 'done' THEN 'Completed'
+		        ELSE taa.stage
+		    END AS currentStage,
+		    CASE WHEN taa.noShow = 1 THEN 'No Show' ELSE IFNULL(DATE_FORMAT(taa.scanAt , '%d-%m-%Y %h:%i %p'), 'Pending') END AS scanAt,
+		    CASE 
+		        WHEN taa.noShow = 1 THEN 'No Show' 
+		        WHEN taa.isDoctor = 1 THEN CEIL(TIMESTAMPDIFF(SECOND, taa.scanAt, taa.doctorAt) / 60)
+		        ELSE 'NA'
+		    END AS scanStageDuration,
+		    CASE WHEN taa.noShow = 1 THEN 'No Show' ELSE IFNULL(DATE_FORMAT(taa.doctorAt , '%d-%m-%Y %h:%i %p'), 'Pending') END AS doctorAt,
+		    CASE 
+		        WHEN taa.noShow = 1 THEN 'No Show' 
+		        WHEN taa.isSeen = 1 THEN CEIL(TIMESTAMPDIFF(SECOND, taa.doctorAt, taa.seenAt) / 60)
+		        ELSE 'NA'
+		    END AS doctorStageDuration,
+		    CASE WHEN taa.noShow = 1 THEN 'No Show' ELSE IFNULL(DATE_FORMAT(taa.seenAt , '%d-%m-%Y %h:%i %p'), 'Pending') END AS seenAt,
+		    CASE 
+		        WHEN taa.noShow = 1 THEN 'No Show' 
+		        WHEN taa.isDone = 1 THEN CEIL(TIMESTAMPDIFF(SECOND, taa.seenAt, taa.doneAt) / 60)
+		        ELSE 'NA'
+		    END AS seenStageDuration,
+		    CASE WHEN taa.noShow = 1 THEN 'No Show' ELSE IFNULL(DATE_FORMAT(taa.doneAt , '%d-%m-%Y %h:%i %p'), 'Pending') END AS doneAt
+		FROM 
+		    treatment_appointments_associations taa
+		INNER JOIN visit_treatment_cycles_associations vtca ON vtca.id = taa.treatmentCycleId 
+		INNER JOIN patient_visits_association pva ON pva.id = vtca.visitId
+		INNER JOIN patient_master pm on pm.id = pva.patientId 
+	) reportData 
+	{{whereCondition}}
+),
+stageStats as (
+	 SELECT
+        JSON_OBJECT(
+            'scan', JSON_OBJECT(
+                '1-15', COUNT(CASE WHEN scanStageDuration BETWEEN 1 AND 15 THEN 1 END),
+                '16-30', COUNT(CASE WHEN scanStageDuration BETWEEN 16 AND 30 THEN 1 END),
+                '31-45', COUNT(CASE WHEN scanStageDuration BETWEEN 31 AND 45 THEN 1 END),
+                '46-60', COUNT(CASE WHEN scanStageDuration BETWEEN 46 AND 60 THEN 1 END),
+                '60-plus', COUNT(CASE WHEN scanStageDuration > 60 THEN 1 END)
+            ),
+            'doctor', JSON_OBJECT(
+                '1-15', COUNT(CASE WHEN doctorStageDuration BETWEEN 1 AND 15 THEN 1 END),
+                '16-30', COUNT(CASE WHEN doctorStageDuration BETWEEN 16 AND 30 THEN 1 END),
+                '31-45', COUNT(CASE WHEN doctorStageDuration BETWEEN 31 AND 45 THEN 1 END),
+                '46-60', COUNT(CASE WHEN doctorStageDuration BETWEEN 46 AND 60 THEN 1 END),
+                '60-plus', COUNT(CASE WHEN doctorStageDuration > 60 THEN 1 END)
+            ),
+            'seen', JSON_OBJECT(
+                '1-15', COUNT(CASE WHEN seenStageDuration BETWEEN 1 AND 15 THEN 1 END),
+                '16-30', COUNT(CASE WHEN seenStageDuration BETWEEN 16 AND 30 THEN 1 END),
+                '31-45', COUNT(CASE WHEN seenStageDuration BETWEEN 31 AND 45 THEN 1 END),
+                '46-60', COUNT(CASE WHEN seenStageDuration BETWEEN 46 AND 60 THEN 1 END),
+                '60-plus', COUNT(CASE WHEN seenStageDuration > 60 THEN 1 END)
+            )
+        ) AS stats
+    FROM stageReportData
+)
+SELECT 
+    JSON_OBJECT(
+        'stageReportDetails', (
+            SELECT JSON_ARRAYAGG(
+                JSON_OBJECT(
+                    'appointmentDetails', appointmentDetails,
+                    'appointmentId', appointmentId,
+                    'type', type,
+                    'appointmentDate', appointmentDate,
+                    'branchId', branchId,
+                    'currentStage', currentStage,
+                    'scanAt', scanAt,
+                    'scanStageDuration', scanStageDuration,
+                    'doctorAt', doctorAt,
+                    'doctorStageDuration', doctorStageDuration,
+                    'seenAt', seenAt,
+                    'seenStageDuration', seenStageDuration,
+                    'doneAt', doneAt
+                )
+            )
+            FROM stageReportData
+        ),
+        'stats', (SELECT stats FROM stageStats LIMIT 1)
+    ) AS stageDurationReport;
+`;
+
+const grnVendorPaymentReportsQuery = `
+select
+	gm.id,gm.grnNo ,sm.supplier, sm.contactNumber as supplierContact, gm.date ,gm.supplierGstNumber ,gm.invoiceNumber ,gm.status ,
+	(
+        CASE
+            WHEN DATEDIFF(CAST(NOW() as DATE), gm.date) > 45 and gm.status <> 'PAID' THEN JSON_OBJECT('stage', 'DUE', 'delay', CONCAT(DATEDIFF(CAST(NOW() as DATE), gm.date) - 45, ' ', 'days'))
+            WHEN DATEDIFF(CAST(NOW() as DATE), gm.date) < 45 and gm.status <> 'PAID' THEN JSON_OBJECT('stage', 'NODUE', 'delay', 'NA')
+        END
+    ) as paymentStageInfo,
+    gpda.netPayable as totalAmount, 
+    (
+    	select IFNULL(sum(gir.totalAmount), 0) from stockmanagement.grn_item_returns gir where gir.grnId = gm.id and gir.supplierId = gm.supplierId
+    ) as returnAmount,
+    CASE 
+        WHEN gpda.netPayable = 0 THEN 0
+        ELSE gpda.netPayable - (
+            SELECT IFNULL(SUM(gir.totalAmount), 0) 
+            FROM stockmanagement.grn_item_returns gir 
+            WHERE gir.grnId = gm.id AND gir.supplierId = gm.supplierId
+        )
+    END AS runningAmount,
+    DATEDIFF(CAST(NOW() AS DATE), gm.date) AS totalDaysSince
+    from
+	stockmanagement.grn_master gm
+	INNER JOIN stockmanagement.grn_payment_details_associations gpda on gpda.grnId = gm.id
+	INNER JOIN stockmanagement.supplier_master sm on sm.id = gm.supplierId 
+	 ORDER BY 
+	  CASE 
+        WHEN gm.status = 'DUE' THEN 1
+        WHEN gm.status = 'PAID' THEN 2
+        ELSE 3 
+      END ASC, totalDaysSince DESC
+`;
+
+const prescribedPurchaseReportQuery = `
+    select 
+	(
+	select
+		JSON_OBJECT(
+			'fullName', CONCAT(IFNULL(pm.firstName, ' '), ' ', IFNULL(pm.lastName, ' ')),
+			'mobileNumber', pm.mobileNo,
+			'aadhaarNumber', pm.aadhaarNo,
+			'patientId', pm.patientId,
+			'dob', pm.dateOfBirth,
+            'photopath',pm.photoPath
+		)
+	from
+		patient_master pm
+	WHERE
+		pm.id = pva.patientId) as patientDetails,
+	caa.appointmentDate,
+	TIME_FORMAT(caa.timeStart, '%H:%i') as timeStart ,
+	TIME_FORMAT(caa.timeEnd, '%H:%i') as timeEnd ,
+	(
+	select
+		cdm.name
+	from
+		consultation_doctor_master cdm
+	where
+		cdm.userId = caa.consultationDoctorId) as doctorName,
+	'Consultation' as type,
+	(
+	select
+		JSON_ARRAYAGG(
+			JSON_OBJECT(
+				'itemName', (select im.itemName from stockmanagement.item_master im where im.id = calba.billTypeValue),
+				'purchaseQuantity', calba.purchaseQuantity ,
+				'prescribedQuantity', calba.prescribedQuantity
+			) 
+		) 
+	) as itemPurchaseDetails
+    from
+        consultation_appointment_line_bills_associations calba
+    INNER JOIN consultation_appointments_associations caa on
+        caa.id = calba.appointmentId
+    INNER JOIN visit_consultations_associations vca on
+        vca.id = caa.consultationId
+    INNER JOIN patient_visits_association pva on
+        pva.id = vca.visitId
+    WHERE
+        calba.billTypeId = 3
+        and calba.status = 'PAID'
+    GROUP by
+        calba.appointmentId
+    UNION
+    select 
+        (
+        select
+            JSON_OBJECT(
+                'fullName', CONCAT(IFNULL(pm.firstName, ' '), ' ', IFNULL(pm.lastName, ' ')),
+                'mobileNumber', pm.mobileNo,
+                'aadhaarNumber', pm.aadhaarNo,
+                'patientId', pm.patientId,
+                'dob', pm.dateOfBirth,
+                'photopath',pm.photoPath
+            )
+        from
+            patient_master pm
+        WHERE
+            pm.id = pva.patientId) as patientDetails,
+        taa.appointmentDate,
+        TIME_FORMAT(taa.timeStart, '%H:%i') as timeStart ,
+        TIME_FORMAT(taa.timeEnd, '%H:%i') as timeEnd ,
+        (
+        select
+            cdm.name
+        from
+            consultation_doctor_master cdm
+        where
+            cdm.userId = taa.consultationDoctorId) as doctorName,
+        'Treatment' as type,
+        (
+        select
+            JSON_ARRAYAGG(
+                JSON_OBJECT(
+                    'itemName', (select im.itemName from stockmanagement.item_master im where im.id = talba.billTypeValue),
+                    'purchaseQuantity', talba.purchaseQuantity ,
+                    'prescribedQuantity', talba.prescribedQuantity
+                ) 
+            ) 
+        ) as itemPurchaseDetails
+    from
+        treatment_appointment_line_bills_associations talba 
+    INNER JOIN treatment_appointments_associations taa  on
+        taa.id = talba.appointmentId
+    INNER JOIN visit_treatment_cycles_associations vtca on
+        vtca.id = taa.treatmentCycleId
+    INNER JOIN patient_visits_association pva on
+        pva.id = vtca.visitId
+    WHERE
+        talba.billTypeId = 3
+        and talba.status = 'PAID'
+    GROUP by
+        talba.appointmentId
+`;
+
+const stockExpiryReportQuery = `
+    WITH expiryDuration AS (
+        SELECT gia.id, DATEDIFF(gia.expiryDate, CAST(NOW() AS DATE)) AS duration
+        FROM stockmanagement.grn_items_associations gia
+    )
+    SELECT
+        im.itemName,
+        gia.batchNo,
+        (gia.totalQuantity * gia.ratePerTablet) AS rate,
+        gia.ratePerTablet,
+        gia.expiryDate,
+        gm.grnNo,
+        gm.branchId,
+        (SELECT bm.name FROM defaultdb.branch_master bm WHERE bm.id = gm.branchId) AS branchName,
+        gia.totalQuantity AS totalStockLeft,
+        (
+            CASE
+                WHEN ed.duration < 0 THEN 'NA'
+                ELSE ed.duration
+            END
+        ) AS daysToExpire,
+        (
+            CASE
+                WHEN ed.duration < 0 THEN ABS(ed.duration)
+                ELSE 'NA'
+            END
+        ) AS daysSinceExpire,
+        (
+            CASE
+                WHEN ed.duration < 7 THEN '1'
+                ELSE 0
+            END
+        ) AS showRedFlag,
+        ed.duration AS daysUntilExpiry
+    FROM stockmanagement.grn_items_associations gia
+    INNER JOIN expiryDuration ed ON ed.id = gia.id
+    INNER JOIN stockmanagement.grn_master gm ON gm.id = gia.grnId
+    INNER JOIN stockmanagement.item_master im ON im.id = gia.itemId
+    WHERE gia.totalQuantity > 0
+        AND (:branchId IS NULL OR gm.branchId = :branchId)
+        AND (
+            :reportType IS NULL
+            OR :reportType = ''
+            OR (:reportType = 'expired' AND ed.duration < 0)
+            OR (
+                :reportType = 'nearExpire'
+                AND ed.duration >= 0
+                AND ed.duration <= :nearExpireDays
+                AND im.isActive = 1
+            )
+        )
+    ORDER BY
+        CASE WHEN :reportType = 'nearExpire' THEN ed.duration END ASC,
+        CASE WHEN :reportType = 'expired' THEN ed.duration END DESC,
+        gia.expiryDate ASC;
+`;
+
+const salesReportQuery = `
+    SELECT
+	JSON_ARRAYAGG(
+        JSON_OBJECT(
+            'productType', productType,
+            'amount', CEIL(total_amount)
+        )
+    ) AS totalSalesProductTypeWise,
+	CEIL(SUM(total_amount)) as totalSales,
+	(
+	select
+		SUM(returnRows.totalAmount)
+	from
+		(
+		select
+			pppr.totalAmount
+		from
+			stockmanagement.patient_pharamacy_purchase_returns pppr
+		INNER JOIN order_details_master odm ON odm.orderId = pppr.orderId
+		INNER JOIN consultation_appointments_associations caa on
+			caa.id = odm.appointmentId
+		where
+			DATE(pppr.returnedDate) BETWEEN :fromDate AND :toDate
+			AND odm.type = 'Consultation'
+			AND caa.branchId = :branchId
+		UNION ALL
+		select
+			pppr.totalAmount
+		from
+			stockmanagement.patient_pharamacy_purchase_returns pppr
+		INNER JOIN order_details_master odm ON odm.orderId = pppr.orderId
+		INNER JOIN treatment_appointments_associations taa on
+			taa.id = odm.appointmentId
+		where
+			DATE(pppr.returnedDate) BETWEEN :fromDate AND :toDate
+			AND odm.type = 'Treatment'
+			AND taa.branchId = :branchId
+		) returnRows
+    ) AS totalReturns
+FROM
+	(
+	SELECT
+		combinedQuery.productType,
+		SUM(combinedQuery.total_amount) AS total_amount
+	FROM
+		(
+		select
+			odm.productType,
+			SUM(odm.paidOrderAmount) as total_amount
+		from
+			order_details_master odm
+		INNER JOIN consultation_appointments_associations caa on
+			caa.id = odm.appointmentId
+		INNER JOIN visit_consultations_associations vca on
+			vca.id = caa.consultationId
+		INNER JOIN patient_visits_association pva on
+			pva.id = vca.visitId
+		WHERE
+			odm.type = 'Consultation'
+			AND odm.paymentStatus = 'PAID'
+			AND DATE(odm.orderDate) BETWEEN :fromDate AND :toDate
+			AND COALESCE(
+			  (
+			    SELECT caa_nb.branchId
+			    FROM consultation_appointments_associations caa_nb
+			    INNER JOIN visit_consultations_associations vca_nb ON vca_nb.id = caa_nb.consultationId
+			    WHERE vca_nb.visitId = vca.visitId
+			    ORDER BY ABS(DATEDIFF(DATE(caa_nb.appointmentDate), DATE(odm.orderDate))), caa_nb.id DESC
+			    LIMIT 1
+			  ),
+			  caa.branchId
+			) = :branchId
+			GROUP by
+				odm.productType
+		UNION ALL
+			select
+				odm.productType,
+				SUM(odm.paidOrderAmount) as total_amount
+			from
+				order_details_master odm
+			INNER JOIN treatment_appointments_associations taa on
+				taa.id = odm.appointmentId
+			INNER JOIN visit_treatment_cycles_associations vtca on
+				vtca.id = taa.treatmentCycleId
+			INNER JOIN patient_visits_association pva on
+				pva.id = vtca.visitId
+			WHERE
+				odm.type = 'Treatment'
+				AND odm.paymentStatus = 'PAID'
+				AND DATE(odm.orderDate) BETWEEN :fromDate AND :toDate
+				AND COALESCE(
+				  (
+				    SELECT taa_nb.branchId
+				    FROM treatment_appointments_associations taa_nb
+				    INNER JOIN visit_treatment_cycles_associations vtca_nb ON vtca_nb.id = taa_nb.treatmentCycleId
+				    WHERE vtca_nb.visitId = vtca.visitId
+				    ORDER BY ABS(DATEDIFF(DATE(taa_nb.appointmentDate), DATE(odm.orderDate))), taa_nb.id DESC
+				    LIMIT 1
+				  ),
+				  taa.branchId
+				) = :branchId
+				GROUP by
+					odm.productType
+        UNION ALL 
+		    SELECT
+				'Milestone' as productType, -- for advance payments also included in the milestone
+				SUM(opom.paidOrderAmount) as total_amount
+			FROM
+				other_payment_orders_master opom
+			INNER JOIN patient_other_payment_associations popa on popa.id = opom.refId
+			WHERE 
+                DATE(opom.orderDate) BETWEEN :fromDate AND :toDate
+                AND opom.paymentStatus = 'PAID' 
+                AND COALESCE(
+                  (
+                    SELECT z.branchId FROM (
+                      SELECT caa_x.branchId AS branchId,
+                             ABS(DATEDIFF(DATE(caa_x.appointmentDate), DATE(opom.orderDate))) AS dd
+                      FROM consultation_appointments_associations caa_x
+                      INNER JOIN visit_consultations_associations vca_x ON vca_x.id = caa_x.consultationId
+                      INNER JOIN patient_visits_association pva_x ON pva_x.id = vca_x.visitId
+                      WHERE pva_x.patientId = popa.patientId
+                      UNION ALL
+                      SELECT taa_x.branchId,
+                             ABS(DATEDIFF(DATE(taa_x.appointmentDate), DATE(opom.orderDate)))
+                      FROM treatment_appointments_associations taa_x
+                      INNER JOIN visit_treatment_cycles_associations vtca_x ON vtca_x.id = taa_x.treatmentCycleId
+                      INNER JOIN patient_visits_association pva_x ON pva_x.id = vtca_x.visitId
+                      WHERE pva_x.patientId = popa.patientId
+                    ) z
+                    ORDER BY z.dd ASC, z.branchId DESC
+                    LIMIT 1
+                  ),
+                  (SELECT uba.branchId FROM user_branch_association uba WHERE uba.userId = opom.createdBy ORDER BY uba.id ASC LIMIT 1),
+                  (SELECT pm.branchId FROM patient_master pm WHERE pm.id = popa.patientId LIMIT 1)
+                ) = :branchId
+                GROUP by
+                    opom.refId
+        UNION ALL 
+		 	SELECT
+                treatmentPayments.productType,
+                SUM(treatmentPayments.paidOrderAmount) AS total_amount
+                FROM (
+                    SELECT
+                        (CASE
+                            WHEN tom.productType LIKE 'APPOINTMENT%' THEN 'Appointments'
+                            ELSE 'Milestone'
+                        END) AS productType,
+                        tom.paidOrderAmount
+                    FROM treatment_orders_master tom
+                    INNER JOIN patient_visits_association pva ON pva.id = tom.visitId
+                    WHERE DATE(tom.orderDate) BETWEEN :fromDate AND :toDate
+                    AND COALESCE(
+                      CASE WHEN tom.productType LIKE 'APPOINTMENT%' THEN (
+                        SELECT taa.branchId FROM treatment_appointments_associations taa
+                        WHERE taa.id = CAST(SUBSTRING(tom.productType, 13) AS UNSIGNED)
+                      ) ELSE NULL END,
+                      (
+                        SELECT taa2.branchId FROM treatment_appointments_associations taa2
+                        INNER JOIN visit_treatment_cycles_associations vtca2 ON vtca2.id = taa2.treatmentCycleId
+                        WHERE vtca2.visitId = tom.visitId
+                        ORDER BY ABS(DATEDIFF(DATE(taa2.appointmentDate), DATE(tom.orderDate))),
+                                 taa2.appointmentDate DESC,
+                                 taa2.id DESC
+                        LIMIT 1
+                      ),
+                      (
+                        SELECT pm.branchId FROM patient_visits_association pva3
+                        INNER JOIN patient_master pm ON pm.id = pva3.patientId
+                        WHERE pva3.id = tom.visitId LIMIT 1
+                      )
+                    ) = :branchId
+                ) AS treatmentPayments 
+                GROUP BY treatmentPayments.productType
+            ) as combinedQuery
+	GROUP BY
+		combinedQuery.productType
+    ) AS subquery;
+`;
+
+const salesDataQuery = `
+    select
+	JSON_OBJECT(
+        'patientName',(select CONCAT(IFNULL(pm.firstName, ''), ' ', IFNULL(pm.lastName, '')) from patient_master pm where pm.id = pva.patientId),
+        'patientId', (select pm.patientId from patient_master pm where pm.id = pva.patientId),
+        'branchId', COALESCE(
+          (
+            SELECT caa_nb.branchId
+            FROM consultation_appointments_associations caa_nb
+            INNER JOIN visit_consultations_associations vca_nb ON vca_nb.id = caa_nb.consultationId
+            WHERE vca_nb.visitId = vca.visitId
+            ORDER BY ABS(DATEDIFF(DATE(caa_nb.appointmentDate), DATE(odm.orderDate))), caa_nb.id DESC
+            LIMIT 1
+          ),
+          caa.branchId
+        ),
+        'branch',(select name from branch_master bm where bm.id = COALESCE(
+          (
+            SELECT caa_nb.branchId
+            FROM consultation_appointments_associations caa_nb
+            INNER JOIN visit_consultations_associations vca_nb ON vca_nb.id = caa_nb.consultationId
+            WHERE vca_nb.visitId = vca.visitId
+            ORDER BY ABS(DATEDIFF(DATE(caa_nb.appointmentDate), DATE(odm.orderDate))), caa_nb.id DESC
+            LIMIT 1
+          ),
+          caa.branchId
+        )),
+        'orderId', odm.orderId ,
+        'type', odm.type ,
+        'date', DATE(odm.orderDate),
+        'paymentMode', odm.paymentMode ,
+        'totalOrderAmount', odm.totalOrderAmount ,
+        'discountAmount', odm.discountAmount,
+        'amount', odm.paidOrderAmount ,
+        'productType', odm.productType,
+        'paymentMasterId', odm.id,
+        'revenueSource', 'ORDER_DETAILS',
+        'isSplitPayment', IFNULL(JSON_UNQUOTE(JSON_EXTRACT(odm.orderDetails, '$[0].isSplitPayment')), ''),
+        'splitPayment', JSON_EXTRACT(odm.orderDetails, '$[0].splitPayment') ) as orderDetails
+    from
+        order_details_master odm
+    INNER JOIN consultation_appointments_associations caa on
+        caa.id = odm.appointmentId
+    INNER JOIN visit_consultations_associations vca on
+        vca.id = caa.consultationId
+    INNER JOIN patient_visits_association pva on
+        pva.id = vca.visitId
+    where
+        DATE(odm.orderDate) BETWEEN :fromDate AND :toDate
+        and odm.appointmentId IS NOT NULL
+        AND odm.paymentStatus = 'PAID'
+        AND odm.type = 'Consultation'
+        AND COALESCE(
+          (
+            SELECT caa_nb.branchId
+            FROM consultation_appointments_associations caa_nb
+            INNER JOIN visit_consultations_associations vca_nb ON vca_nb.id = caa_nb.consultationId
+            WHERE vca_nb.visitId = vca.visitId
+            ORDER BY ABS(DATEDIFF(DATE(caa_nb.appointmentDate), DATE(odm.orderDate))), caa_nb.id DESC
+            LIMIT 1
+          ),
+          caa.branchId
+        ) = :branchId
+    UNION ALL
+    select
+        JSON_OBJECT(
+            'patientName',(select CONCAT(IFNULL(pm.firstName, ''), ' ', IFNULL(pm.lastName, '')) from patient_master pm where pm.id = pva.patientId),
+            'patientId', (select pm.patientId from patient_master pm where pm.id = pva.patientId),
+            'branchId', COALESCE(
+              (
+                SELECT taa_nb.branchId
+                FROM treatment_appointments_associations taa_nb
+                INNER JOIN visit_treatment_cycles_associations vtca_nb ON vtca_nb.id = taa_nb.treatmentCycleId
+                WHERE vtca_nb.visitId = vtca.visitId
+                ORDER BY ABS(DATEDIFF(DATE(taa_nb.appointmentDate), DATE(odm.orderDate))), taa_nb.id DESC
+                LIMIT 1
+              ),
+              taa.branchId
+            ),
+            'branch',(select name from branch_master bm where bm.id = COALESCE(
+              (
+                SELECT taa_nb.branchId
+                FROM treatment_appointments_associations taa_nb
+                INNER JOIN visit_treatment_cycles_associations vtca_nb ON vtca_nb.id = taa_nb.treatmentCycleId
+                WHERE vtca_nb.visitId = vtca.visitId
+                ORDER BY ABS(DATEDIFF(DATE(taa_nb.appointmentDate), DATE(odm.orderDate))), taa_nb.id DESC
+                LIMIT 1
+              ),
+              taa.branchId
+            )),
+            'orderId', odm.orderId ,
+            'type', odm.type ,
+            'date', DATE(odm.orderDate),
+            'paymentMode', odm.paymentMode ,
+            'totalOrderAmount', odm.totalOrderAmount ,
+            'discountAmount', odm.discountAmount,
+            'amount', odm.paidOrderAmount ,
+            'productType', odm.productType,
+            'paymentMasterId', odm.id,
+            'revenueSource', 'ORDER_DETAILS',
+            'isSplitPayment', IFNULL(JSON_UNQUOTE(JSON_EXTRACT(odm.orderDetails, '$[0].isSplitPayment')), ''),
+            'splitPayment', JSON_EXTRACT(odm.orderDetails, '$[0].splitPayment')
+        ) as orderDetails
+    from
+        order_details_master odm
+    INNER JOIN treatment_appointments_associations taa on
+        taa.id = odm.appointmentId
+    INNER JOIN visit_treatment_cycles_associations vtca on
+        vtca.id = taa.treatmentCycleId
+    INNER JOIN patient_visits_association pva on
+        pva.id = vtca.visitId
+    where
+        DATE(odm.orderDate) BETWEEN :fromDate AND :toDate
+        and odm.appointmentId IS NOT NULL
+        AND odm.paymentStatus = 'PAID'
+        AND odm.type = 'Treatment'
+        AND COALESCE(
+          (
+            SELECT taa_nb.branchId
+            FROM treatment_appointments_associations taa_nb
+            INNER JOIN visit_treatment_cycles_associations vtca_nb ON vtca_nb.id = taa_nb.treatmentCycleId
+            WHERE vtca_nb.visitId = vtca.visitId
+            ORDER BY ABS(DATEDIFF(DATE(taa_nb.appointmentDate), DATE(odm.orderDate))), taa_nb.id DESC
+            LIMIT 1
+          ),
+          taa.branchId
+        ) = :branchId
+    UNION ALL
+    SELECT 
+    	JSON_OBJECT(
+            'patientName', CONCAT(IFNULL(pm.firstName, ''), ' ', IFNULL(pm.lastName, '')),
+            'patientId',  pm.patientId ,
+            'branchId', COALESCE(
+              (
+                SELECT z.branchId FROM (
+                  SELECT caa_x.branchId AS branchId,
+                         ABS(DATEDIFF(DATE(caa_x.appointmentDate), DATE(opom.orderDate))) AS dd
+                  FROM consultation_appointments_associations caa_x
+                  INNER JOIN visit_consultations_associations vca_x ON vca_x.id = caa_x.consultationId
+                  INNER JOIN patient_visits_association pva_x ON pva_x.id = vca_x.visitId
+                  WHERE pva_x.patientId = popa.patientId
+                  UNION ALL
+                  SELECT taa_x.branchId,
+                         ABS(DATEDIFF(DATE(taa_x.appointmentDate), DATE(opom.orderDate)))
+                  FROM treatment_appointments_associations taa_x
+                  INNER JOIN visit_treatment_cycles_associations vtca_x ON vtca_x.id = taa_x.treatmentCycleId
+                  INNER JOIN patient_visits_association pva_x ON pva_x.id = vtca_x.visitId
+                  WHERE pva_x.patientId = popa.patientId
+                ) z
+                ORDER BY z.dd ASC, z.branchId DESC
+                LIMIT 1
+              ),
+              (SELECT uba.branchId FROM user_branch_association uba WHERE uba.userId = opom.createdBy ORDER BY uba.id ASC LIMIT 1),
+              pm.branchId
+            ),
+            'branch',(select name from branch_master bm where bm.id = COALESCE(
+              (
+                SELECT z.branchId FROM (
+                  SELECT caa_x.branchId AS branchId,
+                         ABS(DATEDIFF(DATE(caa_x.appointmentDate), DATE(opom.orderDate))) AS dd
+                  FROM consultation_appointments_associations caa_x
+                  INNER JOIN visit_consultations_associations vca_x ON vca_x.id = caa_x.consultationId
+                  INNER JOIN patient_visits_association pva_x ON pva_x.id = vca_x.visitId
+                  WHERE pva_x.patientId = popa.patientId
+                  UNION ALL
+                  SELECT taa_x.branchId,
+                         ABS(DATEDIFF(DATE(taa_x.appointmentDate), DATE(opom.orderDate)))
+                  FROM treatment_appointments_associations taa_x
+                  INNER JOIN visit_treatment_cycles_associations vtca_x ON vtca_x.id = taa_x.treatmentCycleId
+                  INNER JOIN patient_visits_association pva_x ON pva_x.id = vtca_x.visitId
+                  WHERE pva_x.patientId = popa.patientId
+                ) z
+                ORDER BY z.dd ASC, z.branchId DESC
+                LIMIT 1
+              ),
+              (SELECT uba.branchId FROM user_branch_association uba WHERE uba.userId = opom.createdBy ORDER BY uba.id ASC LIMIT 1),
+              pm.branchId
+            )),
+            'orderId', opom.orderId ,
+            'type', opom.type ,
+            'date', DATE(opom.orderDate),
+            'paymentMode', opom.paymentMode ,
+            'totalOrderAmount', opom.totalOrderAmount ,
+            'discountAmount', opom.discountAmount,
+            'amount', opom.paidOrderAmount ,
+            'productType', popa.appointmentReason,
+            'paymentMasterId', opom.id,
+            'revenueSource', 'OTHER_PAYMENT'
+        ) as orderDetails
+        FROM 
+            other_payment_orders_master opom 
+        INNER JOIN patient_other_payment_associations popa on 
+            popa.id = opom.refId
+        INNER JOIN patient_master pm on 
+            pm.id = popa.patientId
+        WHERE opom.paymentStatus  = 'PAID'
+        AND COALESCE(
+          (
+            SELECT z.branchId FROM (
+              SELECT caa_x.branchId AS branchId,
+                     ABS(DATEDIFF(DATE(caa_x.appointmentDate), DATE(opom.orderDate))) AS dd
+              FROM consultation_appointments_associations caa_x
+              INNER JOIN visit_consultations_associations vca_x ON vca_x.id = caa_x.consultationId
+              INNER JOIN patient_visits_association pva_x ON pva_x.id = vca_x.visitId
+              WHERE pva_x.patientId = popa.patientId
+              UNION ALL
+              SELECT taa_x.branchId,
+                     ABS(DATEDIFF(DATE(taa_x.appointmentDate), DATE(opom.orderDate)))
+              FROM treatment_appointments_associations taa_x
+              INNER JOIN visit_treatment_cycles_associations vtca_x ON vtca_x.id = taa_x.treatmentCycleId
+              INNER JOIN patient_visits_association pva_x ON pva_x.id = vtca_x.visitId
+              WHERE pva_x.patientId = popa.patientId
+            ) z
+            ORDER BY z.dd ASC, z.branchId DESC
+            LIMIT 1
+          ),
+          (SELECT uba.branchId FROM user_branch_association uba WHERE uba.userId = opom.createdBy ORDER BY uba.id ASC LIMIT 1),
+          pm.branchId
+        ) = :branchId
+        AND DATE(opom.orderDate) BETWEEN :fromDate AND :toDate
+    UNION ALL
+   	select  
+        JSON_OBJECT(
+            'patientName',(select CONCAT(IFNULL(pm.firstName, ''), ' ', IFNULL(pm.lastName, '')) from patient_master pm where pm.id = pva.patientId),
+            'patientId', (select pm.patientId from patient_master pm where pm.id = pva.patientId),
+            'branchId', COALESCE(
+              CASE WHEN tom.productType LIKE 'APPOINTMENT%' THEN (
+                SELECT taa.branchId FROM treatment_appointments_associations taa
+                WHERE taa.id = CAST(SUBSTRING(tom.productType, 13) AS UNSIGNED)
+              ) ELSE NULL END,
+              (
+                SELECT taa2.branchId FROM treatment_appointments_associations taa2
+                INNER JOIN visit_treatment_cycles_associations vtca2 ON vtca2.id = taa2.treatmentCycleId
+                WHERE vtca2.visitId = tom.visitId
+                ORDER BY ABS(DATEDIFF(DATE(taa2.appointmentDate), DATE(tom.orderDate))),
+                         taa2.appointmentDate DESC,
+                         taa2.id DESC
+                LIMIT 1
+              ),
+              (SELECT pm.branchId FROM patient_master pm WHERE pm.id = pva.patientId LIMIT 1)
+            ),
+            'branch',(select name from branch_master bm where bm.id = COALESCE(
+              CASE WHEN tom.productType LIKE 'APPOINTMENT%' THEN (
+                SELECT taa.branchId FROM treatment_appointments_associations taa
+                WHERE taa.id = CAST(SUBSTRING(tom.productType, 13) AS UNSIGNED)
+              ) ELSE NULL END,
+              (
+                SELECT taa2.branchId FROM treatment_appointments_associations taa2
+                INNER JOIN visit_treatment_cycles_associations vtca2 ON vtca2.id = taa2.treatmentCycleId
+                WHERE vtca2.visitId = tom.visitId
+                ORDER BY ABS(DATEDIFF(DATE(taa2.appointmentDate), DATE(tom.orderDate))),
+                         taa2.appointmentDate DESC,
+                         taa2.id DESC
+                LIMIT 1
+              ),
+              (SELECT pm.branchId FROM patient_master pm WHERE pm.id = pva.patientId LIMIT 1)
+            )),
+            'orderId', tom.orderId ,
+            'type', tom.type ,
+            'date', DATE(tom.orderDate),
+            'paymentMode', tom.paymentMode ,
+            'totalOrderAmount', tom.totalOrderAmount ,
+            'discountAmount', tom.discountAmount,
+            'amount', tom.paidOrderAmount ,
+            'productType', (
+            	CASE 
+            		WHEN tom.productType LIKE 'APPOINTMENT%' THEN (
+						select
+							arm.name
+						from
+							treatment_appointments_associations taa
+						INNER JOIN appointment_reason_master arm on
+							arm.id = taa.appointmentReasonId
+						where
+							taa.id = SUBSTRING(tom.productType, 13) 
+            		)
+            		ELSE tom.productType 
+            	END
+            ),
+            'paymentMasterId', tom.id,
+            'revenueSource', 'TREATMENT_ORDER'
+        ) as orderDetails 
+    from treatment_orders_master tom 
+    INNER JOIN patient_visits_association pva on pva.id = tom.visitId 
+    where
+        DATE(tom.orderDate) BETWEEN :fromDate AND :toDate
+        AND COALESCE(
+          CASE WHEN tom.productType LIKE 'APPOINTMENT%' THEN (
+            SELECT taa.branchId FROM treatment_appointments_associations taa
+            WHERE taa.id = CAST(SUBSTRING(tom.productType, 13) AS UNSIGNED)
+          ) ELSE NULL END,
+          (
+            SELECT taa3.branchId FROM treatment_appointments_associations taa3
+            INNER JOIN visit_treatment_cycles_associations vtca3 ON vtca3.id = taa3.treatmentCycleId
+            WHERE vtca3.visitId = tom.visitId
+            ORDER BY ABS(DATEDIFF(DATE(taa3.appointmentDate), DATE(tom.orderDate))),
+                     taa3.appointmentDate DESC,
+                     taa3.id DESC
+            LIMIT 1
+          ),
+          (SELECT pm.branchId FROM patient_master pm WHERE pm.id = pva.patientId LIMIT 1)
+        ) = :branchId
+`;
+
+const pharmacyReturnDiscountSql = `
+  CASE
+    WHEN CAST(odm.paidOrderAmount AS DECIMAL(10, 2)) > 0
+      AND CAST(odm.totalOrderAmount AS DECIMAL(10, 2)) > CAST(odm.paidOrderAmount AS DECIMAL(10, 2))
+    THEN ROUND(
+      pppr.totalAmount * (
+        (CAST(odm.totalOrderAmount AS DECIMAL(10, 2)) - CAST(odm.paidOrderAmount AS DECIMAL(10, 2)))
+        / CAST(odm.paidOrderAmount AS DECIMAL(10, 2))
+      ),
+      2
+    )
+    WHEN CAST(odm.discountAmount AS DECIMAL(10, 2)) > 0
+      AND CAST(odm.totalOrderAmount AS DECIMAL(10, 2)) > 0
+    THEN ROUND(
+      pppr.totalAmount * (
+        CAST(odm.discountAmount AS DECIMAL(10, 2))
+        / CAST(odm.totalOrderAmount AS DECIMAL(10, 2))
+      ),
+      2
+    )
+    ELSE 0
+  END`;
+
+const returnsDataQuery = `
+    select
+	JSON_OBJECT(
+        'patientName',(select CONCAT(IFNULL(pm.firstName, ''), ' ', IFNULL(pm.lastName, '')) from patient_master pm where pm.id = pva.patientId),
+        'patientId', (select pm.patientId from patient_master pm where pm.id = pva.patientId),
+        'branchId', COALESCE(
+          (
+            SELECT caa_nb.branchId
+            FROM consultation_appointments_associations caa_nb
+            INNER JOIN visit_consultations_associations vca_nb ON vca_nb.id = caa_nb.consultationId
+            WHERE vca_nb.visitId = vca.visitId
+            ORDER BY ABS(DATEDIFF(DATE(caa_nb.appointmentDate), DATE(odm.orderDate))), caa_nb.id DESC
+            LIMIT 1
+          ),
+          caa.branchId
+        ),
+        'branch',(select name from branch_master bm where bm.id = COALESCE(
+          (
+            SELECT caa_nb.branchId
+            FROM consultation_appointments_associations caa_nb
+            INNER JOIN visit_consultations_associations vca_nb ON vca_nb.id = caa_nb.consultationId
+            WHERE vca_nb.visitId = vca.visitId
+            ORDER BY ABS(DATEDIFF(DATE(caa_nb.appointmentDate), DATE(odm.orderDate))), caa_nb.id DESC
+            LIMIT 1
+          ),
+          caa.branchId
+        )),
+        'orderId', odm.orderId ,
+        'type', odm.type ,
+        'date', DATE(pppr.returnedDate),
+        'amount', pppr.totalAmount  ,
+        'discountAmount', ${pharmacyReturnDiscountSql},
+        'paymentMode', COALESCE(
+            NULLIF(JSON_UNQUOTE(JSON_EXTRACT(pppr.returnDetails, '$.refundMethod')), ''),
+            'CASH'
+        ),
+        'productType', odm.productType ) as orderDetails
+    from
+        stockmanagement.patient_pharamacy_purchase_returns pppr INNER JOIN
+        order_details_master odm ON pppr.orderId  = odm.orderId 
+    INNER JOIN consultation_appointments_associations caa on
+        caa.id = odm.appointmentId
+    INNER JOIN visit_consultations_associations vca on
+        vca.id = caa.consultationId
+    INNER JOIN patient_visits_association pva on
+        pva.id = vca.visitId
+    where
+        DATE(pppr.returnedDate) BETWEEN :fromDate AND :toDate
+        AND odm.type = 'Consultation'
+        AND COALESCE(
+          (
+            SELECT caa_nb.branchId
+            FROM consultation_appointments_associations caa_nb
+            INNER JOIN visit_consultations_associations vca_nb ON vca_nb.id = caa_nb.consultationId
+            WHERE vca_nb.visitId = vca.visitId
+            ORDER BY ABS(DATEDIFF(DATE(caa_nb.appointmentDate), DATE(odm.orderDate))), caa_nb.id DESC
+            LIMIT 1
+          ),
+          caa.branchId
+        ) = :branchId
+    UNION ALL
+    select
+        JSON_OBJECT(
+            'patientName',(select CONCAT(IFNULL(pm.firstName, ''), ' ', IFNULL(pm.lastName, '')) from patient_master pm where pm.id = pva.patientId),
+            'patientId', (select pm.patientId from patient_master pm where pm.id = pva.patientId),
+            'branchId', COALESCE(
+              (
+                SELECT taa_nb.branchId
+                FROM treatment_appointments_associations taa_nb
+                INNER JOIN visit_treatment_cycles_associations vtca_nb ON vtca_nb.id = taa_nb.treatmentCycleId
+                WHERE vtca_nb.visitId = vtca.visitId
+                ORDER BY ABS(DATEDIFF(DATE(taa_nb.appointmentDate), DATE(odm.orderDate))), taa_nb.id DESC
+                LIMIT 1
+              ),
+              taa.branchId
+            ),
+            'branch',(select name from branch_master bm where bm.id = COALESCE(
+              (
+                SELECT taa_nb.branchId
+                FROM treatment_appointments_associations taa_nb
+                INNER JOIN visit_treatment_cycles_associations vtca_nb ON vtca_nb.id = taa_nb.treatmentCycleId
+                WHERE vtca_nb.visitId = vtca.visitId
+                ORDER BY ABS(DATEDIFF(DATE(taa_nb.appointmentDate), DATE(odm.orderDate))), taa_nb.id DESC
+                LIMIT 1
+              ),
+              taa.branchId
+            )),
+            'orderId', odm.orderId ,
+            'type', odm.type ,
+            'date', DATE(pppr.returnedDate),
+            'amount', pppr.totalAmount ,
+            'discountAmount', ${pharmacyReturnDiscountSql},
+            'paymentMode', COALESCE(
+                NULLIF(JSON_UNQUOTE(JSON_EXTRACT(pppr.returnDetails, '$.refundMethod')), ''),
+                'CASH'
+            ),
+            'productType', odm.productType 
+    ) as orderDetails
+    from
+        stockmanagement.patient_pharamacy_purchase_returns pppr INNER JOIN
+        order_details_master odm ON pppr.orderId  = odm.orderId 
+    INNER JOIN treatment_appointments_associations taa on
+        taa.id = odm.appointmentId
+    INNER JOIN visit_treatment_cycles_associations vtca on
+        vtca.id = taa.treatmentCycleId
+    INNER JOIN patient_visits_association pva on
+        pva.id = vtca.visitId
+    where
+        DATE(pppr.returnedDate) BETWEEN :fromDate AND :toDate
+        AND odm.type = 'Treatment'
+        AND COALESCE(
+          (
+            SELECT taa_nb.branchId
+            FROM treatment_appointments_associations taa_nb
+            INNER JOIN visit_treatment_cycles_associations vtca_nb ON vtca_nb.id = taa_nb.treatmentCycleId
+            WHERE vtca_nb.visitId = vtca.visitId
+            ORDER BY ABS(DATEDIFF(DATE(taa_nb.appointmentDate), DATE(odm.orderDate))), taa_nb.id DESC
+            LIMIT 1
+          ),
+          taa.branchId
+        ) = :branchId;
+`;
+const patientPharmacySalesReportQuery = `
+SELECT 
+    odm.orderId,
+    CONCAT(pm.lastName, ' ', pm.firstName) AS patientName,
+    pm.patientId AS patientId,
+    odm.totalOrderAmount as totalAmount,
+    COALESCE(pppr.returnAmount, 0) AS returnAmount,  
+    odm.paymentMode
+FROM 
+    order_details_master odm
+INNER JOIN 
+    consultation_appointment_line_bills_associations calba ON calba.appointmentId = odm.appointmentId
+INNER JOIN 
+    consultation_appointments_associations caa ON caa.id = calba.appointmentId
+INNER JOIN 
+    visit_consultations_associations vca ON caa.consultationId = vca.id
+INNER JOIN 
+    patient_visits_association pva ON pva.id = vca.visitId
+INNER JOIN 
+    patient_master pm ON pm.id = pva.patientId
+LEFT JOIN 
+    (
+        SELECT 
+            orderId,
+            SUM(totalAmount) AS returnAmount
+        FROM 
+            stockmanagement.patient_pharamacy_purchase_returns
+        GROUP BY 
+            orderId
+    ) pppr ON pppr.orderId = odm.orderId
+WHERE 
+    odm.productType = 'PHARMACY'
+GROUP BY 
+    odm.orderId,
+    pm.patientId,
+    pm.firstName,
+    pm.lastName,
+    odm.totalOrderAmount,
+    pppr.returnAmount,
+    odm.paymentMode;
+`;
+
+const grnSalesReportQuery = `SELECT 
+gm.id,
+sm.supplier,
+gm.grnNo,
+gpm.orderId AS invoiceId,
+gpm.paymentDate AS invoiceDate, 
+ROUND(SUM(CASE WHEN gia.taxPercentage = 12 THEN gia.rate ELSE 0 END), 2) AS Tax12Gross,
+ROUND(SUM(CASE WHEN gia.taxPercentage = 12 THEN gia.rate * (gia.taxPercentage / 100) ELSE 0 END), 2) AS Tax12Amount,
+ROUND(SUM(CASE WHEN gia.taxPercentage = 5 THEN gia.rate ELSE 0 END), 2) AS Tax5Gross,
+ROUND(SUM(CASE WHEN gia.taxPercentage = 5 THEN gia.rate * (gia.taxPercentage / 100) ELSE 0 END), 2) AS Tax5Amount,
+ROUND(SUM(CASE WHEN gia.taxPercentage = 18 THEN gia.rate ELSE 0 END), 2) AS Tax18Gross,
+ROUND(SUM(CASE WHEN gia.taxPercentage = 18 THEN gia.rate * (gia.taxPercentage / 100) ELSE 0 END), 2) AS Tax18Amount,
+ROUND(SUM(CASE WHEN gia.taxPercentage = 28 THEN gia.rate ELSE 0 END), 2) AS Tax28Gross,
+ROUND(SUM(CASE WHEN gia.taxPercentage = 28 THEN gia.rate * (gia.taxPercentage / 100) ELSE 0 END), 2) AS Tax28Amount,
+ROUND(SUM(gia.discountAmount), 2) AS discount,
+ROUND(
+    (SUM(CASE WHEN gia.taxPercentage = 12 THEN gia.rate ELSE 0 END) + 
+    SUM(CASE WHEN gia.taxPercentage = 12 THEN gia.rate * (gia.taxPercentage / 100) ELSE 0 END) + 
+    SUM(CASE WHEN gia.taxPercentage = 5 THEN gia.rate ELSE 0 END) + 
+    SUM(CASE WHEN gia.taxPercentage = 5 THEN gia.rate * (gia.taxPercentage / 100) ELSE 0 END) + 
+    SUM(CASE WHEN gia.taxPercentage = 18 THEN gia.rate ELSE 0 END) + 
+    SUM(CASE WHEN gia.taxPercentage = 18 THEN gia.rate * (gia.taxPercentage / 100) ELSE 0 END) + 
+    SUM(CASE WHEN gia.taxPercentage = 28 THEN gia.rate ELSE 0 END) + 
+    SUM(CASE WHEN gia.taxPercentage = 28 THEN gia.rate * (gia.taxPercentage / 100) ELSE 0 END) - 
+    SUM(gia.discountAmount)), 2
+) AS TotalGRN
+FROM 
+stockmanagement.grn_master gm 
+INNER JOIN 
+stockmanagement.grn_items_associations gia ON gm.id = gia.grnId
+INNER JOIN 
+stockmanagement.supplier_master sm ON sm.id = gm.supplierId 
+INNER JOIN
+stockmanagement.grn_payments_master gpm ON gpm.grnNo = gm.grnNo
+GROUP BY  
+gm.grnNo;
+`;
+
+const getStockReportQuery = `
+WITH itemQuantity AS (
+    SELECT
+        im.id,
+        COALESCE(SUM(CASE
+            WHEN gm.id IS NOT NULL AND gm.branchId IN (:branchId) THEN gia.totalQuantity
+            ELSE 0
+        END), 0) AS totalQuantity
+    FROM
+        stockmanagement.item_master im
+    LEFT JOIN stockmanagement.grn_items_associations gia 
+        ON gia.itemId = im.id AND gia.isReturned = 0
+    LEFT JOIN stockmanagement.grn_master gm 
+        ON gm.id = gia.grnId 
+    WHERE
+        im.isActive = 1
+    GROUP BY 
+        im.id
+),
+itemInformation AS (
+    SELECT
+        im.id, 
+        JSON_ARRAYAGG(
+            CASE
+                WHEN gm.id IS NOT NULL AND gm.branchId IN (:branchId) THEN
+                    JSON_OBJECT(
+                        'grnItemAssociationId', gia.id,
+                        'grnId', gia.grnId,
+                        'invoiceNumber', gm.invoiceNumber,
+                        'batchNo', gia.batchNo,
+                        'supplierName', (SELECT sm.supplier FROM stockmanagement.supplier_master sm WHERE sm.id = gm.supplierId),
+                        'availableQuantity', gia.totalQuantity,
+                        'branchId', gm.branchId,
+                        'expiryDate', gia.expiryDate,
+                        'branchName', (select bm.name from branch_master bm where bm.id = gm.branchId) 
+                    )
+            END
+        ) AS grnDetails
+    FROM
+        stockmanagement.item_master im
+    LEFT JOIN stockmanagement.grn_items_associations gia 
+        ON gia.itemId = im.id AND gia.isReturned = 0
+    LEFT JOIN stockmanagement.grn_master gm 
+        ON gm.id = gia.grnId 
+    WHERE
+        im.isActive = 1
+    GROUP BY 
+        im.id
+)
+SELECT
+    im.id AS itemId,
+    im.itemName, 
+    COALESCE(iq.totalQuantity, 0) AS totalQuantity,
+    CASE 
+        WHEN iq.totalQuantity = 0 OR iq.totalQuantity IS NULL THEN JSON_ARRAY()
+        ELSE ii.grnDetails
+    END AS grnDetails
+FROM
+    stockmanagement.item_master im
+LEFT JOIN itemQuantity iq ON iq.id = im.id
+LEFT JOIN itemInformation ii ON ii.id = im.id
+WHERE
+    im.isActive = 1
+ORDER BY
+    totalQuantity ASC;
+`;
+
+const getItemPurchaseHistoryQuery = `
+select
+	*
+from
+	(
+	select
+		(
+		select
+			im.itemName
+		from
+			stockmanagement.item_master im
+		where
+			im.id = calba.billTypeValue) as itemName,
+		calba.purchaseQuantity,
+		caa.appointmentDate ,
+		(
+		select
+			arm.name
+		from
+			appointment_reason_master arm
+		where
+			arm.id = caa.appointmentReasonId) as appointmentReason,
+		'Consultation' as type,
+		odm.orderId ,
+		CAST(odm.orderDate as DATE) as orderDate ,
+		odm.paymentMode,
+		pm.patientId ,
+		CONCAT(pm.lastName, ' ', COALESCE(pm.firstName, '')) as patientName,
+		pm.mobileNo,
+		(
+		select
+			cdm.name
+		from
+			consultation_doctor_master cdm
+		where
+			cdm.userId = caa.consultationDoctorId) as prescribedBy
+	from
+		consultation_appointment_line_bills_associations calba
+	INNER JOIN consultation_appointments_associations caa on
+		caa.id = calba.appointmentId
+	INNER JOIN visit_consultations_associations vca on
+		vca.id = caa.consultationId
+	INNER JOIN patient_visits_association pva on
+		pva.id = vca.visitId
+	LEFT JOIN order_details_master odm on
+		odm.appointmentId = caa.id
+	INNER JOIN patient_master pm on
+		pm.id = pva.patientId
+	WHERE
+		calba.status = 'PAID'
+		and odm.type = 'Consultation'
+		and odm.productType = 'PHARMACY'
+		and calba.billTypeId = 3
+		and calba.billTypeValue = :itemId
+UNION ALL
+	select
+		(
+		select
+			im.itemName
+		from
+			stockmanagement.item_master im
+		where
+			im.id = talba.billTypeValue) as itemName,
+		talba.purchaseQuantity,
+		taa.appointmentDate ,
+		(
+		select
+			arm.name
+		from
+			appointment_reason_master arm
+		where
+			arm.id = taa.appointmentReasonId) as appointmentReason,
+		'Treatment' as type,
+		odm.orderId ,
+		CAST(odm.orderDate as DATE) as orderDate ,
+		odm.paymentMode,
+		pm.patientId ,
+		CONCAT(pm.lastName, ' ', COALESCE(pm.firstName, '')) as patientName,
+		pm.mobileNo,
+		(
+		select
+			cdm.name
+		from
+			consultation_doctor_master cdm
+		where
+			cdm.userId = taa.consultationDoctorId) as prescribedBy
+	from
+		treatment_appointment_line_bills_associations talba
+	INNER JOIN treatment_appointments_associations taa on
+		taa.id = talba.appointmentId
+	INNER JOIN visit_treatment_cycles_associations vtca on
+		vtca.id = taa.treatmentCycleId
+	INNER JOIN patient_visits_association pva on
+		pva.id = vtca.visitId
+	LEFT JOIN order_details_master odm on
+		odm.appointmentId = taa.id
+	INNER JOIN patient_master pm on
+		pm.id = pva.patientId
+	WHERE
+		talba.status = 'PAID'
+		and odm.type = 'Treatment'
+		and odm.productType = 'PHARMACY'
+		and talba.billTypeId = 3
+		and talba.billTypeValue = :itemId
+) itemPurchaseReport
+ORDER BY
+	orderDate desc
+
+`;
+
+const getGrnStockReportTabQuery = `
+WITH soldByItemBranch AS (
+  SELECT
+    sold.itemId,
+    sold.branchId,
+    SUM(sold.soldQuantity) AS soldQuantity
+  FROM (
+    SELECT
+      calba.billTypeValue AS itemId,
+      caa.branchId AS branchId,
+      SUM(COALESCE(calba.purchaseQuantity, 0)) AS soldQuantity
+    FROM consultation_appointment_line_bills_associations calba
+    INNER JOIN consultation_appointments_associations caa ON caa.id = calba.appointmentId
+    WHERE
+      calba.billTypeId = 3
+      AND calba.status = 'PAID'
+      AND (:fromDate IS NULL OR DATE(caa.appointmentDate) >= :fromDate)
+      AND (:toDate IS NULL OR DATE(caa.appointmentDate) <= :toDate)
+      AND (:branchId IS NULL OR caa.branchId = :branchId)
+    GROUP BY calba.billTypeValue, caa.branchId
+
+    UNION ALL
+
+    SELECT
+      talba.billTypeValue AS itemId,
+      taa.branchId AS branchId,
+      SUM(COALESCE(talba.purchaseQuantity, 0)) AS soldQuantity
+    FROM treatment_appointment_line_bills_associations talba
+    INNER JOIN treatment_appointments_associations taa ON taa.id = talba.appointmentId
+    WHERE
+      talba.billTypeId = 3
+      AND talba.status = 'PAID'
+      AND (:fromDate IS NULL OR DATE(taa.appointmentDate) >= :fromDate)
+      AND (:toDate IS NULL OR DATE(taa.appointmentDate) <= :toDate)
+      AND (:branchId IS NULL OR taa.branchId = :branchId)
+    GROUP BY talba.billTypeValue, taa.branchId
+  ) sold
+  GROUP BY sold.itemId, sold.branchId
+)
+SELECT
+  gia.grnId,
+  im.id AS itemId,
+  im.itemName AS productName,
+  COALESCE(gia.totalQuantity, 0) AS availableQuantity,
+  COALESCE(gia.mrpPerTablet, gia.ratePerTablet, 0) AS price,
+  COALESCE(sold.soldQuantity, 0) AS soldQuantity,
+  COALESCE(gia.batchNo, '-') AS batchNo,
+  gm.branchId,
+  COALESCE(bm.branchCode, bm.name, '-') AS branch
+FROM stockmanagement.grn_items_associations gia
+INNER JOIN stockmanagement.grn_master gm ON gm.id = gia.grnId
+INNER JOIN stockmanagement.item_master im ON im.id = gia.itemId
+LEFT JOIN branch_master bm ON bm.id = gm.branchId
+LEFT JOIN soldByItemBranch sold ON sold.itemId = gia.itemId AND sold.branchId = gm.branchId
+WHERE
+  im.isActive = 1
+  AND gia.isReturned = 0
+  AND (:fromDate IS NULL OR DATE(gm.date) >= :fromDate)
+  AND (:toDate IS NULL OR DATE(gm.date) <= :toDate)
+  AND (:branchId IS NULL OR gm.branchId = :branchId)
+ORDER BY DATE(gm.date) DESC, im.itemName ASC;
+`;
+
+const pharmacySalesDetailedReportQuery = `
+SELECT
+  src.branch,
+  src.patientName,
+  src.medicineName,
+  ROUND(
+    CASE
+      WHEN SUM(src.soldQuantity) > 0 THEN SUM(src.soldQuantity * src.unitPrice) / SUM(src.soldQuantity)
+      ELSE 0
+    END,
+    2
+  ) AS mrp,
+  ROUND(SUM(src.soldQuantity), 2) AS totalQuantitySold,
+  ROUND(SUM(src.soldQuantity * src.unitPrice), 2) AS totalAmount
+FROM (
+  SELECT
+    COALESCE(bm.branchCode, bm.name, '-') AS branch,
+    CONCAT(pm.lastName, ' ', COALESCE(pm.firstName, '')) AS patientName,
+    COALESCE(im.itemName, '-') AS medicineName,
+    CAST(COALESCE(calba.purchaseQuantity, 0) AS DECIMAL(18,2)) AS soldQuantity,
+    CAST(
+      COALESCE(
+        NULLIF(ipm.price, 0),
+        NULLIF(gp.mrpPerTablet, 0),
+        NULLIF(gp.ratePerTablet, 0),
+        0
+      ) AS DECIMAL(18,2)
+    ) AS unitPrice
+  FROM consultation_appointment_line_bills_associations calba
+  INNER JOIN consultation_appointments_associations caa ON caa.id = calba.appointmentId
+  INNER JOIN visit_consultations_associations vca ON vca.id = caa.consultationId
+  INNER JOIN patient_visits_association pva ON pva.id = vca.visitId
+  INNER JOIN patient_master pm ON pm.id = pva.patientId
+  LEFT JOIN branch_master bm ON bm.id = caa.branchId
+  INNER JOIN stockmanagement.item_master im ON im.id = calba.billTypeValue
+  LEFT JOIN stockmanagement.item_price_master ipm ON ipm.itemId = im.id
+  LEFT JOIN (
+    SELECT gi.itemId, gi.mrpPerTablet, gi.ratePerTablet
+    FROM stockmanagement.grn_items_associations gi
+    INNER JOIN (
+      SELECT itemId, MAX(id) AS maxId
+      FROM stockmanagement.grn_items_associations
+      WHERE isReturned = 0
+      GROUP BY itemId
+    ) lm ON lm.maxId = gi.id
+  ) gp ON gp.itemId = im.id
+  WHERE
+    calba.billTypeId = 3
+    AND calba.status = 'PAID'
+    AND (:branchId IS NULL OR caa.branchId = :branchId)
+    AND EXISTS (
+      SELECT 1
+      FROM order_details_master odm
+      WHERE
+        odm.appointmentId = calba.appointmentId
+        AND odm.type = 'Consultation'
+        AND odm.productType = 'PHARMACY'
+        AND odm.paymentStatus = 'PAID'
+        AND (:fromDate IS NULL OR DATE(odm.orderDate) >= :fromDate)
+        AND (:toDate IS NULL OR DATE(odm.orderDate) <= :toDate)
+    )
+
+  UNION ALL
+
+  SELECT
+    COALESCE(bm.branchCode, bm.name, '-') AS branch,
+    CONCAT(pm.lastName, ' ', COALESCE(pm.firstName, '')) AS patientName,
+    COALESCE(im.itemName, '-') AS medicineName,
+    CAST(COALESCE(talba.purchaseQuantity, 0) AS DECIMAL(18,2)) AS soldQuantity,
+    CAST(
+      COALESCE(
+        NULLIF(ipm.price, 0),
+        NULLIF(gp.mrpPerTablet, 0),
+        NULLIF(gp.ratePerTablet, 0),
+        0
+      ) AS DECIMAL(18,2)
+    ) AS unitPrice
+  FROM treatment_appointment_line_bills_associations talba
+  INNER JOIN treatment_appointments_associations taa ON taa.id = talba.appointmentId
+  INNER JOIN visit_treatment_cycles_associations vtca ON vtca.id = taa.treatmentCycleId
+  INNER JOIN patient_visits_association pva ON pva.id = vtca.visitId
+  INNER JOIN patient_master pm ON pm.id = pva.patientId
+  LEFT JOIN branch_master bm ON bm.id = taa.branchId
+  INNER JOIN stockmanagement.item_master im ON im.id = talba.billTypeValue
+  LEFT JOIN stockmanagement.item_price_master ipm ON ipm.itemId = im.id
+  LEFT JOIN (
+    SELECT gi.itemId, gi.mrpPerTablet, gi.ratePerTablet
+    FROM stockmanagement.grn_items_associations gi
+    INNER JOIN (
+      SELECT itemId, MAX(id) AS maxId
+      FROM stockmanagement.grn_items_associations
+      WHERE isReturned = 0
+      GROUP BY itemId
+    ) lm ON lm.maxId = gi.id
+  ) gp ON gp.itemId = im.id
+  WHERE
+    talba.billTypeId = 3
+    AND talba.status = 'PAID'
+    AND (:branchId IS NULL OR taa.branchId = :branchId)
+    AND EXISTS (
+      SELECT 1
+      FROM order_details_master odm
+      WHERE
+        odm.appointmentId = talba.appointmentId
+        AND odm.type = 'Treatment'
+        AND odm.productType = 'PHARMACY'
+        AND odm.paymentStatus = 'PAID'
+        AND (:fromDate IS NULL OR DATE(odm.orderDate) >= :fromDate)
+        AND (:toDate IS NULL OR DATE(odm.orderDate) <= :toDate)
+    )
+) src
+WHERE src.soldQuantity > 0
+GROUP BY src.branch, src.patientName, src.medicineName
+ORDER BY totalAmount DESC, totalQuantitySold DESC;
+`;
+
+const noShowReportQuery = `
+SELECT * FROM (
+    SELECT 
+        pm.patientId,
+        CONCAT(pm.lastName, ' ', pm.firstName) AS patientName,
+        bm.branchCode AS branch, 
+        caa.id AS appointmentId,
+        'Consultation' AS type,
+        arm.name AS appointmentReason,
+        caa.appointmentDate,
+        caa.noShow,
+        caa.noShowReason 
+    FROM patient_master pm 
+    INNER JOIN patient_visits_association pva ON pva.patientId = pm.id 
+    INNER JOIN visit_consultations_associations vca ON vca.visitId = pva.id 
+    INNER JOIN consultation_appointments_associations caa ON caa.consultationId = vca.id
+    INNER JOIN appointment_reason_master arm ON caa.appointmentReasonId = arm.id
+    INNER JOIN branch_master bm ON bm.id = caa.branchId 
+    WHERE caa.noShow = 1
+
+    UNION 
+    
+    SELECT 
+        pm.patientId,
+        CONCAT(pm.lastName, ' ', pm.firstName) AS patientName,
+        bm.branchCode AS branch, 
+        taa.id AS appointmentId,
+        'Treatment' AS type,
+        arm.name AS appointmentReason,
+        taa.appointmentDate,
+        taa.noShow,
+        taa.noShowReason 
+    FROM patient_master pm 
+    INNER JOIN patient_visits_association pva ON pva.patientId = pm.id 
+    INNER JOIN visit_treatment_cycles_associations vtca ON vtca.visitId = pva.id 
+    INNER JOIN treatment_appointments_associations taa ON taa.treatmentCycleId = vtca.id
+    INNER JOIN appointment_reason_master arm ON taa.appointmentReasonId = arm.id
+    INNER JOIN branch_master bm ON bm.id = taa.branchId 
+    WHERE taa.noShow = 1
+) AS combined_results
+ORDER BY appointmentDate DESC;
+`;
+
+const treatmentCycleHistoryQuery = `
+SELECT
+    pm.patientId,
+	CONCAT(pm.lastName,' ', COALESCE(pm.firstName)) as patientName, 
+	COALESCE(pga.name,'-') as spouseName,
+	(SELECT vtm.name from visit_type_master vtm where vtm.id = pva.type) as visitType,
+	ttm.name as treatmentType,
+	ttm.isPackageExists,
+	pva.id as visitId
+FROM
+	patient_master pm
+LEFT JOIN patient_guardian_associations pga ON pga.patientId = pm.id
+INNER JOIN patient_visits_association pva  ON pm.id = pva.patientId and pva.isActive = 1
+LEFT JOIN visit_packages_associations vpa ON vpa.visitId  = pva.id
+INNER JOIN visit_treatment_cycles_associations vtca on vtca.visitId  = pva.id
+INNER JOIN treatment_type_master ttm ON ttm.id = vtca.treatmentTypeId
+`;
+
+const vendorManufacturerDepartmentReportQuery = `
+SELECT
+  dm.id AS departmentId,
+  dm.name AS departmentName,
+  sm.id AS vendorId,
+  sm.supplier AS vendorName,
+  mm.id AS manufacturerId,
+  mm.manufacturer AS manufacturerName,
+  COUNT(DISTINCT gm.id) AS grnCount,
+  COUNT(gia.id) AS lineItems,
+  COALESCE(SUM(gia.totalQuantity), 0) AS totalQuantity,
+  ROUND(COALESCE(SUM(gia.amount), 0), 2) AS totalAmount
+FROM stockmanagement.grn_master gm
+INNER JOIN stockmanagement.supplier_master sm ON sm.id = gm.supplierId
+INNER JOIN stockmanagement.grn_items_associations gia ON gia.grnId = gm.id
+INNER JOIN stockmanagement.item_master im ON im.id = gia.itemId
+LEFT JOIN stockmanagement.manufacturer_master mm ON mm.id = im.manufacturerName
+LEFT JOIN defaultdb.department_master dm ON dm.id = im.departmentId
+WHERE 1 = 1
+  AND (:fromDate IS NULL OR CAST(gm.date AS DATE) >= :fromDate)
+  AND (:toDate IS NULL OR CAST(gm.date AS DATE) <= :toDate)
+  AND (:departmentId IS NULL OR im.departmentId = :departmentId)
+  AND (:vendorId IS NULL OR gm.supplierId = :vendorId)
+  AND (:manufacturerId IS NULL OR im.manufacturerName = :manufacturerId)
+  AND (:includeReturned = 1 OR gia.isReturned = 0)
+  AND (
+    :searchQuery IS NULL
+    OR dm.name LIKE :searchQuery
+    OR sm.supplier LIKE :searchQuery
+    OR mm.manufacturer LIKE :searchQuery
+  )
+GROUP BY
+  dm.id, dm.name,
+  sm.id, sm.supplier,
+  mm.id, mm.manufacturer
+ORDER BY totalAmount DESC, totalQuantity DESC;
+`;
+
+module.exports = {
+  appointmentStageDurationReportQuery,
+  grnVendorPaymentReportsQuery,
+  prescribedPurchaseReportQuery,
+  stockExpiryReportQuery,
+  salesReportQuery,
+  salesDataQuery,
+  returnsDataQuery,
+  patientPharmacySalesReportQuery,
+  grnSalesReportQuery,
+  getGrnStockReportTabQuery,
+  pharmacySalesDetailedReportQuery,
+  getStockReportQuery,
+  getItemPurchaseHistoryQuery,
+  noShowReportQuery,
+  treatmentCycleHistoryQuery,
+  vendorManufacturerDepartmentReportQuery
+};
